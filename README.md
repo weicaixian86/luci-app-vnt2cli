@@ -27,12 +27,38 @@ OpenWrt LuCI 插件，用于管理 VNT2 命令行客户端 `vnt2_cli` 和控制�
 - 版本 sidecar：`/etc/config/vnt2-cli.version`（记录最近一次自动下载安装的 tag 与两个二进制的路径/大小/修改时间）。
 - 设备 ID 保留清单：`/lib/upgrade/keep.d/vnt2cli`。
 
-## 编译
+## 安装方法
 
-- OpenWrt 24.10.x SDK 输出 `.ipk`，25.12.x SDK 输出 `.apk`；安装包架构无关（`-all`），运行时按设备架构自动下载对应二进制。
-- 使用 GitHub Actions 页面的 `Build Release` 工作流手动触发，输入 Release tag 与可选描述；产物命名固定为 `luci-app-vnt2cli_<版本>-all.ipk` 与 `luci-app-vnt2cli_<版本>-all.apk`。
-- 本地检查：`tests/validate-source.sh`（Shell 语法、Lua 语法、YAML、UTF-8/BOM、包名与固定版本门禁）。
+### OpenWrt 24.10.x（IPK）
 
-## 依赖
+系统 -> 软件包 -> 上传软件包，安装即可；或通过 SSH：
 
-`luci-base`、`luci-compat`、`kmod-tun`、`curl`、`ca-bundle`、`unzip`、`jsonfilter`。
+```sh
+opkg install /tmp/luci-app-vnt2cli_*.ipk
+```
+
+### OpenWrt 25.12.x（APK）
+
+Release 发布的 `.apk` 由 SDK 自编译构建，未使用官方签名密钥，属于未签名包，安装和后续升级都需要 `--allow-untrusted` 参数。将 APK 上传到路由器 `/tmp/` 后通过 SSH 执行：
+
+```sh
+apk add --allow-untrusted /tmp/luci-app-vnt2cli_*.apk
+apk info luci-app-vnt2cli
+```
+
+LuCI 的软件包上传页面不会自动添加 `--allow-untrusted` 参数，APK 请通过 SSH 安装。若后续使用固定签名密钥构建并发布公钥，则可去掉该参数直接安装升级。
+
+
+## 卸载方法
+
+OpenWrt 24.10.x：
+
+```sh
+opkg remove luci-app-vnt2cli
+```
+
+OpenWrt 25.12.x：
+
+```sh
+apk del luci-app-vnt2cli
+```
