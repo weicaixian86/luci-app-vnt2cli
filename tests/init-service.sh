@@ -39,18 +39,30 @@ assert_not_contains() {
 
 # --- start instance model ---
 assert_contains "$INIT" 'procd_set_param env RUST_LOG="$log_level"' "start injects RUST_LOG"
-assert_contains "$INIT" '--conf \"${conf_path}\"' "start passes absolute --conf path"
 assert_contains "$INIT" '--ctrl-port \"${ctrl_port}\"' "start passes explicit --ctrl-port"
 assert_contains "$INIT" 'valid_port "$ctrl_port" || ctrl_port="11233"' "invalid ctrl_port falls back to 11233"
-assert_contains "$INIT" 'start skipped: no valid config file selected under /vnt_config' "missing conf_file skips start with message"
-assert_contains "$INIT" 'toml_validate_client_config' "start validates the TOML"
-assert_contains "$INIT" 'client config missing network_code and subscription' "TOML validation accepts subscription-only configs"
+assert_contains "$INIT" 'client config missing network_code and subscription' "start rejects configs without identity"
 
-# --- network sync driven by single enabled config ---
-assert_contains "$INIT" 'config_get "$cfg" "conf_file"' "network sync reads conf_file from UCI"
-assert_not_contains "$INIT" 'read_running_config_names' "no multi-instance auto-start record reader"
-assert_not_contains "$INIT" 'vnt_current_config' "no /vnt_current_config.txt usage"
-assert_contains "$INIT" 'NETWORK_SYNC_RESULT="no-active-config"' "no active config cleans managed network objects"
+# --- single-config export model ---
+assert_contains "$INIT" 'TOML_EXPORT_FILE="/tmp/vnt2cli.toml"' "runtime toml path fixed"
+assert_contains "$INIT" 'export_client_config "$cfg"' "start exports the runtime toml"
+assert_contains "$INIT" 'start failed: runtime toml export failed' "export failure blocks client start"
+assert_contains "$INIT" '--conf \"${TOML_EXPORT_FILE}\"' "start passes the exported toml via --conf"
+assert_contains "$INIT" 'client config missing network_code and subscription' "export rejects configs without identity"
+assert_contains "$INIT" 'tunnel_addr and tunnel_port are mutually exclusive' "export enforces tunnel_addr/tunnel_port mutual exclusion"
+assert_contains "$INIT" 'mv -f "$tmp" "$TOML_EXPORT_FILE"' "export publishes atomically"
+assert_contains "$INIT" 'toml_put_list "$tmp" "server" "$cfg" "server"' "server list exported"
+assert_contains "$INIT" 'toml_put_string "$tmp" "password"' "password exported with escaping"
+assert_contains "$INIT" 'toml_escape' "toml values escaped"
+
+# --- network sync reads UCI directly ---
+assert_contains "$INIT" 'config_get "$cfg" "device_mode"' "network sync reads device_mode from UCI"
+assert_contains "$INIT" 'config_get "$cfg" "ip"' "network sync reads virtual ip from UCI"
+assert_contains "$INIT" 'config_get "$cfg" "no_nat"' "network sync reads no_nat from UCI"
+assert_not_contains "$INIT" 'toml_get_' "no legacy toml parsers in init"
+assert_not_contains "$INIT" 'conf_file' "no config-file selection in init"
+assert_not_contains "$INIT" 'vnt_config' "no /vnt_config usage in init"
+assert_contains "$INIT" 'NETWORK_SYNC_RESULT="no-device-mode"' "device_mode no cleans managed network objects"
 
 # --- firewall: no web port rules, four forwarding directions kept ---
 assert_contains "$INIT" 'firewall.vnt2fwlan' "forwarding rule vnt2fwlan managed"

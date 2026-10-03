@@ -11,7 +11,7 @@ DOWNLOAD_LOG="/tmp/vnt2-download.log"
 
 CLI_TIME="/tmp/vnt2_cli_time"
 
-VNT_CONFIG_DIR="/vnt_config"
+TOML_EXPORT_FILE="/tmp/vnt2cli.toml"
 MACHINE_ID_FILE="/etc/machine-id"
 DBUS_MACHINE_ID_FILE="/var/lib/dbus/machine-id"
 
@@ -110,6 +110,154 @@ valid_port() {
 
 sanitize_name() {
 	printf '%s' "$1" | sed 's/[^A-Za-z0-9._-]/_/g'
+}
+
+# ---------- UCI to runtime TOML export ----------
+# /etc/config/vnt2 is the single source of truth for the one and only client
+# config. The runtime TOML /tmp/vnt2cli.toml is regenerated from UCI on every
+# start; hand edits to it never survive a restart.
+
+toml_escape() {
+	printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\r\n\000'
+}
+
+TOML_LIST_OUT=""
+
+__toml_collect_list_item() {
+	local item
+	item="$(toml_escape "$1")"
+	[ -n "$item" ] || return 0
+	if [ -n "$TOML_LIST_OUT" ]; then
+		TOML_LIST_OUT="${TOML_LIST_OUT}, \"${item}\""
+	else
+		TOML_LIST_OUT="\"${item}\""
+	fi
+}
+
+toml_list_nonempty() {
+	TOML_LIST_HAS=0
+	config_list_foreach "$1" "$2" __toml_list_nonempty_cb
+}
+
+__toml_list_nonempty_cb() {
+	TOML_LIST_HAS=1
+}
+
+toml_put_string() {
+	local file="$1"
+	local key="$2"
+	local value="$3"
+
+	[ -n "$value" ] || return 0
+	printf '%s = "%s"\n' "$key" "$(toml_escape "$value")" >>"$file"
+}
+
+toml_put_bool() {
+	local file="$1"
+	local key="$2"
+	local value="$3"
+
+	[ -n "$value" ] || return 0
+	if [ "$value" = "1" ]; then
+		printf '%s = true\n' "$key" >>"$file"
+	else
+		printf '%s = false\n' "$key" >>"$file"
+	fi
+}
+
+toml_put_number() {
+	local file="$1"
+	local key="$2"
+	local value="$3"
+
+	case "$value" in
+		''|*[!0-9]*) return 0 ;;
+	esac
+	printf '%s = %s\n' "$key" "$value" >>"$file"
+}
+
+toml_put_list() {
+	local file="$1"
+	local key="$2"
+	local section="$3"
+	local option="$4"
+
+	TOML_LIST_OUT=""
+	config_list_foreach "$section" "$option" __toml_collect_list_item
+	[ -n "$TOML_LIST_OUT" ] || return 0
+	printf '%s = [%s]\n' "$key" "$TOML_LIST_OUT" >>"$file"
+}
+
+export_client_config() {
+	local cfg="$1"
+	local tmp="${TOML_EXPORT_FILE}.$$"
+	local network_code subscription tunnel_port
+
+	rm -f "$tmp"
+	(umask 077; : >"$tmp") || {
+		log_service 'export failed: unable to create runtime toml temporary file'
+		return 1
+	}
+
+	toml_put_string "$tmp" "subscription" "$(config_get "$cfg" "subscription")"
+	toml_put_list "$tmp" "server" "$cfg" "server"
+	toml_put_list "$tmp" "peer_address" "$cfg" "peer_address"
+	toml_put_list "$tmp" "turn" "$cfg" "turn"
+	toml_put_list "$tmp" "punch_model" "$cfg" "punch_model"
+	toml_put_string "$tmp" "network_code" "$(config_get "$cfg" "network_code")"
+	toml_put_string "$tmp" "ip" "$(config_get "$cfg" "ip")"
+	toml_put_bool "$tmp" "no_punch" "$(config_get "$cfg" "no_punch")"
+	toml_put_bool "$tmp" "no_broadcast" "$(config_get "$cfg" "no_broadcast")"
+	toml_put_bool "$tmp" "allow_ikev2" "$(config_get "$cfg" "allow_ikev2")"
+	toml_put_bool "$tmp" "allow_wireguard" "$(config_get "$cfg" "allow_wireguard")"
+	toml_put_bool "$tmp" "rtx" "$(config_get "$cfg" "rtx")"
+	toml_put_bool "$tmp" "compress" "$(config_get "$cfg" "compress")"
+	toml_put_bool "$tmp" "fec" "$(config_get "$cfg" "fec")"
+	toml_put_list "$tmp" "input" "$cfg" "input"
+	toml_put_list "$tmp" "subnet_mapping" "$cfg" "subnet_mapping"
+	toml_put_list "$tmp" "output" "$cfg" "output"
+	toml_put_bool "$tmp" "auto_sync_subnet" "$(config_get "$cfg" "auto_sync_subnet")"
+	toml_put_bool "$tmp" "no_nat" "$(config_get "$cfg" "no_nat")"
+	toml_put_string "$tmp" "device_mode" "$(config_get "$cfg" "device_mode")"
+	toml_put_number "$tmp" "mtu" "$(config_get "$cfg" "mtu")"
+	toml_put_list "$tmp" "port_mapping" "$cfg" "port_mapping"
+	toml_put_bool "$tmp" "allow_mapping" "$(config_get "$cfg" "allow_mapping")"
+	toml_put_string "$tmp" "device_id" "$(config_get "$cfg" "device_id")"
+	toml_put_string "$tmp" "device_name" "$(config_get "$cfg" "device_name")"
+	toml_put_string "$tmp" "tun_name" "$(config_get "$cfg" "tun_name")"
+	toml_put_string "$tmp" "outbound_interface" "$(config_get "$cfg" "outbound_interface")"
+	toml_put_string "$tmp" "password" "$(config_get "$cfg" "password")"
+	toml_put_string "$tmp" "cert_mode" "$(config_get "$cfg" "cert_mode")"
+	toml_put_list "$tmp" "udp_stun" "$cfg" "udp_stun"
+	toml_put_list "$tmp" "tcp_stun" "$cfg" "tcp_stun"
+	toml_put_list "$tmp" "tunnel_addr" "$cfg" "tunnel_addr"
+	toml_put_number "$tmp" "tunnel_port" "$(config_get "$cfg" "tunnel_port")"
+	toml_put_string "$tmp" "event_script" "$(config_get "$cfg" "event_script")"
+
+	toml_list_nonempty "$cfg" "tunnel_addr"
+	tunnel_port="$(config_get "$cfg" "tunnel_port")"
+	if [ "$TOML_LIST_HAS" = "1" ] && [ -n "$tunnel_port" ]; then
+		log_service 'export failed: tunnel_addr and tunnel_port are mutually exclusive'
+		rm -f "$tmp"
+		return 1
+	fi
+
+	network_code="$(config_get "$cfg" "network_code")"
+	subscription="$(config_get "$cfg" "subscription")"
+	if [ -z "$network_code" ] && [ -z "$subscription" ]; then
+		log_service 'export failed: client config missing network_code and subscription'
+		rm -f "$tmp"
+		return 1
+	fi
+
+	chmod 600 "$tmp" >/dev/null 2>&1
+	if ! mv -f "$tmp" "$TOML_EXPORT_FILE"; then
+		rm -f "$tmp"
+		log_service 'export failed: unable to publish runtime toml'
+		return 1
+	fi
+	log_service "runtime toml exported: ${TOML_EXPORT_FILE}"
+	return 0
 }
 
 write_download_state() {
@@ -1414,124 +1562,6 @@ prepare_binary() {
 	return 1
 }
 
-toml_get_raw() {
-	local file="$1"
-	local key="$2"
-	local raw
-	[ -f "$file" ] || return 1
-	raw="$(sed -n "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*//p" "$file" | head -n1)"
-	# TOML accepts inline comments and either quoting style. Normalize both so
-	# device_mode values written as `'tun' # comment` are not misread as a
-	# configuration without a virtual device.
-	printf '%s\n' "$raw" | awk '
-		BEGIN { dq = sprintf("%c", 34); sq = sprintf("%c", 39); bs = sprintf("%c", 92) }
-		{
-			out = ""
-			quote = ""
-			escaped = 0
-			for (i = 1; i <= length($0); i++) {
-				c = substr($0, i, 1)
-				if (quote != "") {
-					out = out c
-					if (quote == dq && escaped) {
-						escaped = 0
-					} else if (quote == dq && c == bs) {
-						escaped = 1
-					} else if (c == quote) {
-						quote = ""
-					}
-				} else if (c == dq || c == sq) {
-					quote = c
-					out = out c
-				} else if (c == "#") {
-					break
-				} else {
-					out = out c
-				}
-			}
-			sub(/[ 	]+$/, "", out)
-			print out
-		}
-	'
-}
-
-toml_get_string() {
-	local file="$1"
-	local key="$2"
-	local raw val
-
-	raw="$(toml_get_raw "$file" "$key" 2>/dev/null)"
-	raw="$(trim_value "$raw")"
-	case "$raw" in
-		\"*\")
-			val="${raw#\"}"
-			val="${val%\"}"
-			printf '%s\n' "$val" | sed 's/\\"/"/g; s/\\\\/\\/g'
-		;;
-		*)
-			printf '%s\n' "$raw"
-		;;
-	esac
-}
-
-toml_get_bool() {
-	local file="$1"
-	local key="$2"
-	local raw
-	raw="$(trim_value "$(toml_get_raw "$file" "$key" 2>/dev/null)")"
-	[ "$raw" = "true" ] && echo "1" || echo "0"
-}
-
-toml_strip_quotes() {
-	printf '%s\n' "$1" | awk '
-		BEGIN { dq = sprintf("%c", 34); sq = sprintf("%c", 39); bs = sprintf("%c", 92) }
-		{
-			s = $0
-			if (length(s) >= 2) {
-				first = substr(s, 1, 1)
-				last = substr(s, length(s), 1)
-				if ((first == dq && last == dq) || (first == sq && last == sq)) {
-					s = substr(s, 2, length(s) - 2)
-				}
-			}
-			print s
-		}
-	'
-}
-
-toml_get_value() {
-	local file="$1"
-	local key="$2"
-	local raw
-
-	# toml_get_raw already removes unquoted inline comments. Strip either TOML
-	# quoting style here so script users can write 'tun' or "tun" identically.
-	raw="$(toml_get_raw "$file" "$key" 2>/dev/null)"
-	raw="$(trim_value "$raw")"
-	toml_strip_quotes "$raw"
-}
-
-toml_validate_client_config() {
-	local file="$1"
-	local network_code subscription
-
-	[ -f "$file" ] || {
-		log_service "client config file missing: ${file}"
-		return 1
-	}
-
-	network_code="$(trim_value "$(toml_get_value "$file" "network_code")")"
-	subscription="$(trim_value "$(toml_get_value "$file" "subscription")")"
-
-	[ -n "$network_code" ] || [ -n "$subscription" ] || {
-		log_service "client config missing network_code and subscription"
-		return 1
-	}
-
-	return 0
-}
-
-
 uci_set_if_changed() {
 	local key="$1"
 	local value="$2"
@@ -1711,17 +1741,6 @@ cleanup_network() {
 	apply_network_config_changes none || return 1
 	apply_firewall_config_changes || return 1
 	return 0
-}
-
-is_safe_toml_name() {
-	local name="$1"
-
-	[ -n "$name" ] || return 1
-	case "$name" in
-		*..*|*/*|*\\*) return 1 ;;
-		*.toml) return 0 ;;
-		*) return 1 ;;
-	esac
 }
 
 device_mode_matches_tun_flags() {
@@ -1933,7 +1952,6 @@ sync_network_state() {
 	local enabled=0
 	local existing_device=""
 	local configured_ip=""
-	local conf_file="" conf_path=""
 
 	NETWORK_SYNC_RESULT=""
 	config_load "$CONF"
@@ -1947,15 +1965,7 @@ sync_network_state() {
 		return 0
 	fi
 
-	conf_file="$(trim_value "$(config_get "$cfg" "conf_file")")"
-	if ! is_safe_toml_name "$conf_file" || [ ! -f "${VNT_CONFIG_DIR}/${conf_file}" ] || [ -L "${VNT_CONFIG_DIR}/${conf_file}" ]; then
-		cleanup_network || return 1
-		NETWORK_SYNC_RESULT="no-active-config"
-		return 0
-	fi
-	conf_path="${VNT_CONFIG_DIR}/${conf_file}"
-
-	prepare_client_network_runtime "$cfg" "$conf_path"
+	prepare_client_network_runtime "$cfg"
 	mode="$VNT2_DEVICE_MODE"
 	tun_name="$VNT2_TUN_NAME"
 	no_nat="$VNT2_NO_NAT"
@@ -1970,7 +1980,7 @@ sync_network_state() {
 		;;
 	esac
 
-	configured_ip="$(trim_value "$(toml_get_value "$conf_path" "ip")")"
+	configured_ip="$(trim_value "$(config_get "$cfg" "ip")")"
 	case "$configured_ip" in
 		*/*) configured_ip="${configured_ip%%/*}" ;;
 	esac
@@ -1994,7 +2004,7 @@ sync_network_state() {
 	fi
 
 	if [ -z "$tun_name" ]; then
-		log_service "network sync waiting for ${mode} device for ${conf_file}"
+		log_service "network sync waiting for ${mode} device"
 		cleanup_network || return 1
 		NETWORK_SYNC_RESULT="missing-runtime-device"
 		return 0
@@ -2035,7 +2045,6 @@ sync_network() {
 
 prepare_client_network_runtime() {
 	local cfg="$1"
-	local conf_file="$2"
 	local bind_dev="" forward_list="" forward_raw="" tun_name device_mode no_nat
 
 	VNT2_FORWARD_LIST=""
@@ -2049,8 +2058,10 @@ prepare_client_network_runtime() {
 		forward_list="${VNT2_FORWARD_LIST}"
 	fi
 
-	tun_name="$(trim_value "$(toml_get_value "${conf_file}" "tun_name")")"
-	device_mode="$(trim_value "$(toml_get_value "${conf_file}" "device_mode")")"
+	# Network sync reads the UCI values directly; the runtime TOML is only
+	# an exported copy for the client process.
+	tun_name="$(trim_value "$(config_get "$cfg" "tun_name")")"
+	device_mode="$(trim_value "$(config_get "$cfg" "device_mode")")"
 	[ -n "$device_mode" ] || device_mode="tun"
 	case "$device_mode" in
 		no|tun|tap) : ;;
@@ -2059,8 +2070,11 @@ prepare_client_network_runtime() {
 			device_mode="tun"
 		;;
 	esac
-	no_nat="$(toml_get_bool "${conf_file}" "no_nat")"
-	[ -n "$no_nat" ] || no_nat="0"
+	no_nat="$(config_get "$cfg" "no_nat")"
+	case "$no_nat" in
+		1) : ;;
+		*) no_nat="0" ;;
+	esac
 
 	VNT2_BIND_DEV="${bind_dev}"
 	VNT2_TUN_NAME="${tun_name}"
@@ -2187,7 +2201,7 @@ ensure_persistent_machine_id() {
 
 start_cli_instance() {
 	local cfg="$1"
-	local enabled cli_bin ctrl_bin ctrl_port log_level conf_file conf_path
+	local enabled cli_bin ctrl_bin ctrl_port log_level
 
 	config_get_bool enabled "$cfg" "enabled" "0"
 	if [ "$enabled" != "1" ]; then
@@ -2198,19 +2212,10 @@ start_cli_instance() {
 
 	log_service 'start requested'
 
-	config_get conf_file "$cfg" "conf_file" ""
-	conf_file="$(trim_value "$conf_file")"
-	if ! is_safe_toml_name "$conf_file" || [ ! -f "${VNT_CONFIG_DIR}/${conf_file}" ] || [ -L "${VNT_CONFIG_DIR}/${conf_file}" ]; then
-		log_service 'start skipped: no valid config file selected under /vnt_config'
-		cleanup_network
+	export_client_config "$cfg" || {
+		log_service 'start failed: runtime toml export failed'
 		return 1
-	fi
-	conf_path="${VNT_CONFIG_DIR}/${conf_file}"
-
-	if ! toml_validate_client_config "$conf_path"; then
-		log_service 'start failed: client TOML validation failed'
-		return 1
-	fi
+	}
 
 	cli_bin="$(prepare_binary "$cfg" "vnt2_cli_bin" "/usr/bin/vnt2_cli" "vnt2_cli" "$DOWNLOAD_CLI_STATE" "cli")" || {
 		log_service 'start failed: missing executable vnt2_cli'
@@ -2232,21 +2237,12 @@ start_cli_instance() {
 		*) log_level="info" ;;
 	esac
 
-	if ! mkdir -p "${VNT_CONFIG_DIR}" >/dev/null 2>&1; then
-		log_service "failed to create config directory: ${VNT_CONFIG_DIR}"
-		return 1
-	fi
-	if ! chmod 700 "${VNT_CONFIG_DIR}" >/dev/null 2>&1; then
-		log_service "failed to secure config directory: ${VNT_CONFIG_DIR}"
-		return 1
-	fi
-
 	ensure_persistent_machine_id || return 1
 
-	log_service "using ${cli_bin} ctrl=${ctrl_bin} port=${ctrl_port} conf=${conf_path}"
+	log_service "using ${cli_bin} ctrl=${ctrl_bin} port=${ctrl_port} conf=${TOML_EXPORT_FILE}"
 	procd_open_instance "vnt2_cli"
 	procd_set_param env RUST_LOG="$log_level"
-	procd_set_param command /bin/sh -c "cd /tmp && exec \"${cli_bin}\" --conf \"${conf_path}\" --ctrl-port \"${ctrl_port}\""
+	procd_set_param command /bin/sh -c "cd /tmp && exec \"${cli_bin}\" --conf \"${TOML_EXPORT_FILE}\" --ctrl-port \"${ctrl_port}\""
 	procd_set_param stdout 0
 	procd_set_param stderr 0
 	procd_set_param respawn 3600 5 5

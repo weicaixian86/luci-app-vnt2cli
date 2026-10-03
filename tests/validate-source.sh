@@ -156,14 +156,18 @@ for pattern in \
 done
 
 # Scanned in runtime sources only: the Makefile postinst must keep deleting
-# these legacy artifacts during upgrades.
+# these legacy artifacts during upgrades. The single-config model additionally
+# forbids any config-file selection or /vnt_config usage in runtime sources.
 for pattern in \
 	'version-worker' \
 	'preview-worker' \
 	'vnt_current_config' \
 	'releases/latest' \
 	'act_config_' \
-	'vnt2_config'; do
+	'vnt2_config' \
+	'conf_file' \
+	'vnt_config' \
+	'toml_get_'; do
 	hits=$(grep -rn -- "$pattern" "${PKG_DIR}/root" "${PKG_DIR}/luasrc" 2>/dev/null | grep -v 'Binary file' || true)
 	if [ -n "$hits" ]; then
 		fail "forbidden reference '${pattern}' found:"
@@ -260,6 +264,24 @@ else
 	fail "init must pass --conf and --ctrl-port explicitly"
 fi
 
+if grep -qF 'TOML_EXPORT_FILE="/tmp/vnt2cli.toml"' "$INIT" && grep -qF -- '--conf \"${TOML_EXPORT_FILE}\"' "$INIT"; then
+	ok
+else
+	fail "init must export and start from the single runtime toml /tmp/vnt2cli.toml"
+fi
+
+if grep -q 'export_client_config "$cfg"' "$INIT"; then
+	ok
+else
+	fail "init must export the runtime toml before starting the client"
+fi
+
+if grep -Eq 'toml_put_[a-z]+ "\$tmp" "ctrl_port"' "$INIT"; then
+	fail "runtime toml must not contain a ctrl_port key (control port goes via --ctrl-port)"
+else
+	ok
+fi
+
 if grep -q -- '--token\|--addr ' "$INIT"; then
 	fail "init must not pass web client arguments (--token/--addr)"
 else
@@ -270,12 +292,6 @@ if grep -q 'procd_set_param respawn 3600 5 5' "$INIT"; then
 	ok
 else
 	fail "client respawn must be bounded (procd_set_param respawn 3600 5 5)"
-fi
-
-if grep -q 'is_safe_toml_name' "$INIT"; then
-	ok
-else
-	fail "init must validate the selected config file name"
 fi
 
 # ---------- control port loopback ----------

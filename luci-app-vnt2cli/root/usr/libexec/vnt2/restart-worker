@@ -4,7 +4,6 @@ PENDING_FILE="${VNT2_RESTART_PENDING_FILE:-/tmp/vnt2-restart.pending}"
 CLAIMED_FILE="${VNT2_RESTART_CLAIMED_FILE:-/tmp/vnt2-restart.claimed}"
 DOWNLOAD_LOG="${VNT2_RESTART_LOG_FILE:-/tmp/vnt2-download.log}"
 RESTART_COMMAND="${VNT2_RESTART_COMMAND:-/etc/init.d/vnt2}"
-NETWORK_CONFIG_DIR="${VNT2_NETWORK_CONFIG_DIR:-/vnt_config}"
 NETWORK_SYNC_COMMAND="${VNT2_NETWORK_SYNC_COMMAND:-/etc/init.d/vnt2 sync_network}"
 SYS_CLASS_NET="${VNT2_SYS_CLASS_NET:-/sys/class/net}"
 RESTART_DELAY="${VNT2_RESTART_DELAY:-15}"
@@ -49,21 +48,11 @@ run_restart() {
 }
 
 read_network_snapshot() {
-	local file name size mtime checksum dir flags address ifindex details
+	local name flags address ifindex details checksum
 
-	if [ -d "$NETWORK_CONFIG_DIR" ]; then
-		for file in "$NETWORK_CONFIG_DIR"/*.toml; do
-			[ -f "$file" ] || continue
-			[ -L "$file" ] && continue
-			name="${file##*/}"
-			size="$(stat -c '%s' "$file" 2>/dev/null || wc -c <"$file" 2>/dev/null || printf '0')"
-			mtime="$(stat -c '%Y' "$file" 2>/dev/null || printf '0')"
-			checksum="$(cksum <"$file" 2>/dev/null || true)"
-			printf '%s %s %s %s\n' "$name" "$size" "$mtime" "$checksum"
-		done
-	fi
-	# UCI changes (enabled flag, selected config file) must also trigger a
-	# network reconciliation even when no TOML file changed.
+	# UCI is the single source of truth for the one and only client config;
+	# any option change (enabled flag, client settings) triggers a network
+	# reconciliation even when no device state changed.
 	checksum="$(uci -q show vnt2 2>/dev/null | sort)"
 	if [ -n "$checksum" ]; then
 		printf 'uci %s\n' "$checksum"

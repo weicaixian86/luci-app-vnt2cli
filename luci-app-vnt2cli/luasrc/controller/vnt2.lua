@@ -76,10 +76,6 @@ local function get_ctrl_port()
 	return port
 end
 
-local function get_active_conf()
-	return uci_first("vnt2_cli", "conf_file", "")
-end
-
 local function get_pid_by_name(name)
 	local pid = trim(sys.exec("pidof " .. shell_quote(name) .. " 2>/dev/null | awk '{print $1}'"))
 	if pid ~= "" then
@@ -443,7 +439,6 @@ function act_status()
 	e.cli_tag = get_local_tag(get_cli_bin())
 	e.cli_target_tag = FIXED_VNT2_VERSION
 	e.log_level = uci_first("vnt2_cli", "log_level", "info")
-	e.conf_file = get_active_conf()
 
 	e.download_log_size = #(get_log_content(DOWNLOAD_LOG_FILE, LOG_DISPLAY_LINES) or "")
 	e.cli_download = dl

@@ -113,7 +113,6 @@ local ctrl_query_url = dsp.build_url("admin", "vpn", "vnt2", "ctrl_query")
 			<table>
 				<tr><td>本地版本</td><td id="cli_tag">-</td></tr>
 				<tr><td>目标版本</td><td id="cli_target_tag">-</td></tr>
-				<tr><td>启用配置</td><td id="cli_conf">-</td></tr>
 				<tr><td>运行时长</td><td id="cli_runtime">-</td></tr>
 				<tr><td>进程/PID</td><td id="cli_pid">-</td></tr>
 				<tr><td>CPU / 内存</td><td id="cli_usage">-</td></tr>
@@ -228,7 +227,6 @@ local ctrl_query_url = dsp.build_url("admin", "vpn", "vnt2", "ctrl_query")
 
 		setHtml("cli_tag", text(data.cli_tag));
 		setHtml("cli_target_tag", text(data.cli_target_tag));
-		setHtml("cli_conf", data.conf_file ? text(data.conf_file) : "<span style='color:#f0ad4e;'>未选择配置文件</span>");
 		setHtml("cli_runtime", text(data.cli_runtime));
 		setHtml("cli_pid", data.cli_running ? ("PID " + text(data.cli_pid)) : "未运行");
 		setHtml("cli_usage", [text(data.cli_cpu, "0"), text(data.cli_ram, "0 MB")].join(" / "));

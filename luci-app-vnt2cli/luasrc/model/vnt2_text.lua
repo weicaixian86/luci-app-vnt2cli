@@ -40,9 +40,10 @@ end
 
 local log_message_exact_map = {
 	["start failed: missing executable vnt2_cli"] = "启动失败：缺少可执行文件 vnt2_cli",
-	["start failed: client TOML validation failed"] = "启动失败：客户端 TOML 配置校验失败",
-	["start skipped: no valid config file selected under /vnt_config"] = "启动跳过：未在 /vnt_config 中选择有效的 TOML 配置文件",
-	["client config missing network_code and subscription"] = "客户端配置缺少 network_code 和 subscription",
+	["start failed: runtime toml export failed"] = "启动失败：运行配置导出失败",
+	["export failed: client config missing network_code and subscription"] = "导出失败：客户端配置缺少 network_code 和 subscription",
+	["export failed: tunnel_addr and tunnel_port are mutually exclusive"] = "导出失败：tunnel_addr 与 tunnel_port 互斥，不能同时填写",
+	["export failed: unable to publish runtime toml"] = "导出失败：无法写入运行配置文件",
 	["control tool vnt2_ctrl is missing or invalid; status page will show control info as unavailable"] = "控制工具 vnt2_ctrl 缺失或无效，状态页控制信息将显示为不可用",
 	["service start flow begin"] = "服务启动流程开始",
 	["vnt2_cli config section not found"] = "未找到 vnt2_cli 配置节",
@@ -56,6 +57,7 @@ local log_message_exact_map = {
 
 local log_message_pattern_rules = {
 	{ "^starting (.+) with config (.+)$", "正在启动 %1，配置文件：%2" },
+	{ "^runtime toml exported: (.+)$", "运行配置已导出：%1" },
 	{ "^using (.+) ctrl=(.+) port=(.+) conf=(.+)$", "使用 %1 控制工具 %2 控制端口 %3 配置文件：%4" },
 	{ "^checking (.+) releases list: (.+)$", "正在检查 %1 的 Releases 列表：%2" },
 	{ "^checking release endpoint: (.+)$", "正在检查发布接口：%1" },
