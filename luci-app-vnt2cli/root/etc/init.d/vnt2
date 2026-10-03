@@ -1,0 +1,2328 @@
+#!/bin/sh /etc/rc.common
+
+START=99
+USE_PROCD=1
+EXTRA_COMMANDS="schedule_restart sync_network"
+EXTRA_HELP="\tschedule_restart\tQueue a restart for the vnt2 worker\n\tsync_network\tReconcile the VNT2 interface and firewall zone"
+
+CONF="vnt2"
+
+DOWNLOAD_LOG="/tmp/vnt2-download.log"
+
+CLI_TIME="/tmp/vnt2_cli_time"
+
+VNT_CONFIG_DIR="/vnt_config"
+MACHINE_ID_FILE="/etc/machine-id"
+DBUS_MACHINE_ID_FILE="/var/lib/dbus/machine-id"
+
+DOWNLOAD_CACHE_BASE="/tmp/vnt2-download-cache"
+DOWNLOAD_CLI_STATE="/tmp/vnt2-download-cli.state"
+VERSION_STATE_FILE="/etc/config/vnt2-cli.version"
+VNT2_FIXED_REPO="vnt-dev/vnt"
+VNT2_FIXED_VERSION="2.0.10"
+GH_PROXY_PREFIX="https://gh-proxy.com/"
+DOWNLOAD_MIRROR_RETRIES=3
+RESTART_PENDING_FILE="/tmp/vnt2-restart.pending"
+
+VNT2_FORWARD_LIST=""
+NETWORK_SYNC_RESULT=""
+SYS_CLASS_NET="${VNT2_SYS_CLASS_NET:-/sys/class/net}"
+
+INSTALL_BIN_DIR="/usr/bin"
+. /lib/functions.sh
+. /lib/functions/procd.sh
+
+normalize_log_text() {
+	printf '%s' "$1" | tr -d '\r\000'
+}
+
+log_service() {
+	local msg
+	msg="$(normalize_log_text "$*")"
+	printf '%s service : %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$msg" >>"${DOWNLOAD_LOG}"
+}
+
+log_download() {
+	local msg
+	msg="$(normalize_log_text "$*")"
+	printf '%s download : %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$msg" >>"${DOWNLOAD_LOG}"
+}
+
+ensure_log_files() {
+	[ -f "${DOWNLOAD_LOG}" ] || : >"${DOWNLOAD_LOG}"
+}
+
+get_first_section_id() {
+	local type="$1"
+	local section=""
+	config_foreach __collect_first_section "$type"
+	section="$FIRST_SECTION_ID"
+	FIRST_SECTION_ID=""
+	echo "$section"
+}
+
+__collect_first_section() {
+	local section="$1"
+	[ -n "$FIRST_SECTION_ID" ] || FIRST_SECTION_ID="$section"
+}
+
+trim_value() {
+	echo "$1" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
+}
+
+find_firewall_zone_name() {
+	local wanted_network="$1"
+	local idx=0
+	local fallback=""
+	local zone_name network_list net
+
+	while uci -q show "firewall.@zone[$idx]" >/dev/null 2>&1; do
+		zone_name="$(trim_value "$(uci -q get "firewall.@zone[$idx].name" 2>/dev/null)")"
+		network_list="$(trim_value "$(uci -q get "firewall.@zone[$idx].network" 2>/dev/null)")"
+
+		if [ -n "$zone_name" ]; then
+			[ "$zone_name" = "$wanted_network" ] && fallback="$zone_name"
+			for net in $network_list; do
+				[ "$net" = "$wanted_network" ] && {
+					echo "$zone_name"
+					return 0
+				}
+			done
+		fi
+
+		idx=$((idx + 1))
+	done
+
+	[ -n "$fallback" ] && {
+		echo "$fallback"
+		return 0
+	}
+
+	return 1
+}
+
+valid_port() {
+	case "$1" in
+		""|*[!0-9]*) return 1 ;;
+	esac
+	[ "$1" -ge 1 ] 2>/dev/null && [ "$1" -le 65535 ] 2>/dev/null
+}
+
+sanitize_name() {
+	printf '%s' "$1" | sed 's/[^A-Za-z0-9._-]/_/g'
+}
+
+write_download_state() {
+	local state_file="$1"
+	local state="$2"
+	local message="$3"
+	local asset="$4"
+	local tag="$5"
+	local arch="$6"
+	local path="$7"
+
+	message="$(normalize_log_text "$message")"
+
+	cat >"${state_file}" <<EOF
+state=${state}
+message=${message}
+asset=${asset}
+tag=${tag}
+arch=${arch}
+path=${path}
+time=$(date '+%Y-%m-%d %H:%M:%S')
+EOF
+}
+
+normalize_state_value() {
+	printf '%s' "$1" | tr -d '\r\n\000'
+}
+
+file_mtime() {
+	local path="$1"
+
+	stat -c '%Y' "$path" 2>/dev/null && return 0
+	date -r "$path" +%s 2>/dev/null
+}
+
+file_size() {
+	local path="$1"
+
+	[ -f "$path" ] || return 1
+	wc -c <"$path" 2>/dev/null | tr -d '[:space:]'
+}
+
+write_version_state() {
+	local tag="$1"
+	local source="$2"
+	local arch="$3"
+	local asset="$4"
+	local cli_path="$5"
+	local ctrl_path="$6"
+	local dir tmp cli_mtime cli_size ctrl_mtime ctrl_size
+
+	[ -n "$cli_path" ] && [ -f "$cli_path" ] || return 1
+	[ -n "$ctrl_path" ] && [ -f "$ctrl_path" ] || return 1
+	dir="${VERSION_STATE_FILE%/*}"
+	mkdir -p "$dir" >/dev/null 2>&1 || return 1
+	tmp="${VERSION_STATE_FILE}.$$"
+	cli_mtime="$(file_mtime "$cli_path")"
+	cli_size="$(file_size "$cli_path")" || return 1
+	ctrl_mtime="$(file_mtime "$ctrl_path")"
+	ctrl_size="$(file_size "$ctrl_path")" || return 1
+
+	if ! (
+		umask 077
+		cat >"$tmp" <<EOF
+tag=$(normalize_state_value "$tag")
+source=$(normalize_state_value "$source")
+arch=$(normalize_state_value "$arch")
+asset=$(normalize_state_value "$asset")
+cli_path=$(normalize_state_value "$cli_path")
+cli_mtime=$(normalize_state_value "$cli_mtime")
+cli_size=$(normalize_state_value "$cli_size")
+ctrl_path=$(normalize_state_value "$ctrl_path")
+ctrl_mtime=$(normalize_state_value "$ctrl_mtime")
+ctrl_size=$(normalize_state_value "$ctrl_size")
+time=$(date '+%Y-%m-%d %H:%M:%S')
+EOF
+	); then
+		rm -f "$tmp"
+		return 1
+	fi
+
+	chmod 600 "$tmp" >/dev/null 2>&1 || {
+		rm -f "$tmp"
+		return 1
+	}
+	mv -f "$tmp" "$VERSION_STATE_FILE" >/dev/null 2>&1 || {
+		rm -f "$tmp"
+		return 1
+	}
+	return 0
+}
+
+clear_version_state() {
+	rm -f "$VERSION_STATE_FILE" "$VERSION_STATE_FILE".* >/dev/null 2>&1
+}
+
+read_version_state_value() {
+	local key="$1"
+
+	[ -f "$VERSION_STATE_FILE" ] || return 1
+	sed -n "s/^${key}=//p" "$VERSION_STATE_FILE" | head -n1
+}
+
+get_version_state_tag() {
+	local tag
+
+	tag="$(read_version_state_value tag)"
+	[ -n "$tag" ] || return 1
+	normalize_release_tag "$tag"
+}
+
+version_state_matches_binary() {
+	local path="$1"
+	local prefix="$2"
+	local state_path state_mtime state_size actual_mtime actual_size
+
+	state_path="$(read_version_state_value "${prefix}_path")"
+	state_mtime="$(read_version_state_value "${prefix}_mtime")"
+	state_size="$(read_version_state_value "${prefix}_size")"
+	[ "$state_path" = "$path" ] || return 1
+	[ -n "$state_mtime" ] && [ -n "$state_size" ] || return 1
+	actual_mtime="$(file_mtime "$path")" || return 1
+	actual_size="$(file_size "$path")" || return 1
+	[ "$actual_mtime" = "$state_mtime" ] && [ "$actual_size" = "$state_size" ]
+}
+
+fixed_binary_state_matches() {
+	local path="$1"
+
+	[ "$(get_version_state_tag 2>/dev/null)" = "$VNT2_FIXED_VERSION" ] || return 1
+	version_state_matches_binary "$path" "cli"
+}
+
+ensure_exec() {
+	local bin="$1"
+	[ -n "$bin" ] || return 1
+	[ -f "$bin" ] || return 1
+	chmod 755 "$bin" >/dev/null 2>&1
+	return 0
+}
+
+is_elf_binary() {
+	local bin="$1"
+	local magic expected
+
+	[ -s "$bin" ] || return 1
+	# BusyBox od does not support the GNU -A/-t/-N options, which made every
+	# real binary look invalid on stock OpenWrt. Read the four magic bytes
+	# with dd and compare against the literal ELF signature.
+	magic="$(dd if="$bin" bs=1 count=4 2>/dev/null)"
+	expected="$(printf '\177ELF')"
+	[ "$magic" = "$expected" ]
+}
+
+ensure_elf_exec() {
+	local bin="$1"
+
+	ensure_exec "$bin" || return 1
+	is_elf_binary "$bin"
+}
+
+detect_arch_name() {
+	local mach package_arch arm_family arm_abi
+	arm_family=""
+	arm_abi=""
+	mach="$(uname -m 2>/dev/null)"
+	package_arch="$(opkg print-architecture 2>/dev/null | awk '$2 != "all" && $2 != "noarch" {print $2; exit}')"
+
+	case "$mach" in
+		x86_64|amd64)
+			echo "x86_64"
+			return 0
+		;;
+		aarch64|arm64)
+			echo "aarch64"
+			return 0
+		;;
+		armv7*)
+			arm_family="armv7"
+		;;
+		armv6*|arm*)
+			arm_family="arm"
+		;;
+		mipsel*)
+			echo "mipsel"
+			return 0
+		;;
+		mips*)
+			echo "mips"
+			return 0
+		;;
+	esac
+
+	if [ -n "$arm_family" ]; then
+		# The musl loader is the authoritative ABI marker. Package names are
+		# used as a fallback where the loader symlink is absent.
+		if [ -e /lib/ld-musl-armhf.so.1 ] || [ -e /lib/ld-musl-armhf.so.1.* ]; then
+			arm_abi="musleabihf"
+		elif [ -e /lib/ld-musl-arm.so.1 ] || [ -e /lib/ld-musl-arm.so.1.* ]; then
+			arm_abi="musleabi"
+		else
+			case "$package_arch" in
+				*eabihf*|*hard*|*hf*|*neon*|*vfp*) arm_abi="musleabihf" ;;
+				*eabi*|*soft*) arm_abi="musleabi" ;;
+				*) arm_abi="" ;;
+			esac
+		fi
+		[ -n "$arm_abi" ] && {
+			echo "${arm_family}-${arm_abi}"
+			return 0
+		}
+		echo "unsupported"
+		return 0
+	fi
+
+	case "$package_arch" in
+		*x86_64*|*amd64*)
+			echo "x86_64"
+		;;
+		*aarch64*|*arm64*)
+			echo "aarch64"
+		;;
+		*mipsel*)
+			echo "mipsel"
+		;;
+		*mips*)
+			echo "mips"
+		;;
+		*)
+			echo "unsupported"
+		;;
+	esac
+}
+
+get_downloader() {
+	local purpose="$1"
+
+	case "$purpose" in
+		asset)
+			if command -v curl >/dev/null 2>&1; then
+				echo "curl"
+				return 0
+			fi
+			if command -v wget >/dev/null 2>&1; then
+				echo "wget"
+				return 0
+			fi
+			if command -v uclient-fetch >/dev/null 2>&1; then
+				echo "uclient-fetch"
+				return 0
+			fi
+		;;
+		*)
+			if command -v curl >/dev/null 2>&1; then
+				echo "curl"
+				return 0
+			fi
+			if command -v uclient-fetch >/dev/null 2>&1; then
+				echo "uclient-fetch"
+				return 0
+			fi
+			if command -v wget >/dev/null 2>&1; then
+				echo "wget"
+				return 0
+			fi
+		;;
+	esac
+
+	return 1
+}
+
+download_file() {
+	local url="$1"
+	local out="$2"
+	local purpose="${3:-generic}"
+	local mirror="${4:-auto}"
+	local custom_mirror_url="$5"
+	local downloader
+	local rc
+	local actual_url
+	local timeout_cmd=""
+	local connect_timeout=20
+	local transfer_timeout=180
+
+	if [ "$purpose" = "api" ]; then
+		connect_timeout=10
+		transfer_timeout=30
+	fi
+
+	downloader="$(get_downloader "$purpose")" || return 1
+	DOWNLOAD_LAST_TOOL="$downloader"
+	DOWNLOAD_LAST_URL=""
+	DOWNLOAD_LAST_RC=""
+	DOWNLOAD_LAST_BYTES="0"
+	if command -v timeout >/dev/null 2>&1; then
+		timeout_cmd="$(command -v timeout)"
+	fi
+
+	for actual_url in $(get_download_url_candidates_for_mirror "$url" "$mirror" "$custom_mirror_url"); do
+		DOWNLOAD_LAST_URL="$actual_url"
+
+		case "$downloader" in
+			curl)
+				curl -fsSL --connect-timeout "$connect_timeout" --max-time "$transfer_timeout" --retry 0 \
+					-A "luci-app-vnt2cli" \
+					-H "Accept: application/vnd.github+json, application/octet-stream, */*" \
+					-o "$out" "$actual_url" >/dev/null 2>&1
+				rc=$?
+			;;
+			wget)
+				if [ -n "$timeout_cmd" ]; then
+					"$timeout_cmd" "$transfer_timeout" wget -q --timeout="$transfer_timeout" --tries=1 \
+						--header="User-Agent: luci-app-vnt2cli" \
+						--header="Accept: application/vnd.github+json, application/octet-stream, */*" \
+						-O "$out" "$actual_url" >/dev/null 2>&1
+				else
+					wget -q --timeout="$transfer_timeout" --tries=1 \
+						--header="User-Agent: luci-app-vnt2cli" \
+						--header="Accept: application/vnd.github+json, application/octet-stream, */*" \
+						-O "$out" "$actual_url" >/dev/null 2>&1
+				fi
+				rc=$?
+			;;
+			uclient-fetch)
+				if [ -n "$timeout_cmd" ]; then
+					"$timeout_cmd" "$transfer_timeout" uclient-fetch -q -T "$transfer_timeout" \
+						--header "User-Agent: luci-app-vnt2cli" \
+						--header "Accept: application/vnd.github+json, application/octet-stream, */*" \
+						-O "$out" "$actual_url" >/dev/null 2>&1
+				else
+					uclient-fetch -q -T "$transfer_timeout" \
+						--header "User-Agent: luci-app-vnt2cli" \
+						--header "Accept: application/vnd.github+json, application/octet-stream, */*" \
+						-O "$out" "$actual_url" >/dev/null 2>&1
+				fi
+				rc=$?
+			;;
+			*)
+				return 1
+			;;
+		esac
+
+		DOWNLOAD_LAST_RC="$rc"
+		[ "$rc" -eq 0 ] && return 0
+		DOWNLOAD_LAST_BYTES="$(wc -c <"$out" 2>/dev/null | tr -d '[:space:]')"
+		[ -n "$DOWNLOAD_LAST_BYTES" ] || DOWNLOAD_LAST_BYTES="0"
+		# A failed downloader may leave a partial file behind.
+		rm -f "$out"
+	done
+
+	return 1
+}
+
+strip_github_proxy_url() {
+	local url="$1"
+
+	url="$(trim_value "$url")"
+	case "$url" in
+		${GH_PROXY_PREFIX}*)
+			echo "${url#${GH_PROXY_PREFIX}}"
+		;;
+		*)
+			echo "$url"
+		;;
+	esac
+}
+
+is_github_download_url() {
+	case "$1" in
+		https://api.github.com/*|https://github.com/*|https://raw.githubusercontent.com/*|https://objects.githubusercontent.com/*|https://release-assets.githubusercontent.com/*)
+			return 0
+		;;
+		*)
+			return 1
+		;;
+	esac
+}
+
+get_download_url_candidates_for_mirror() {
+	local url="$1"
+	local mirror="$2"
+	local custom_mirror_url="$3"
+	local raw_url
+
+	url="$(trim_value "$url")"
+	raw_url="$(strip_github_proxy_url "$url")"
+	mirror="$(normalize_download_mirror "$mirror")"
+	custom_mirror_url="$(normalize_custom_mirror_url "$custom_mirror_url")"
+	[ -n "$raw_url" ] || return 0
+
+	if [ "$mirror" = "github" ]; then
+		printf '%s\n' "$raw_url"
+	elif [ "$mirror" = "gh-proxy" ] && is_github_download_url "$raw_url"; then
+		printf '%s\n' "${GH_PROXY_PREFIX}${raw_url}"
+	elif [ "$mirror" = "custom" ] && [ -n "$custom_mirror_url" ] && is_github_download_url "$raw_url"; then
+		printf '%s\n' "${custom_mirror_url}${raw_url}"
+		printf '%s\n' "$raw_url"
+	else
+		# A selected mirror must not silently fall back to gh-proxy. The outer
+		# mirror loop owns source failover and retry counting.
+		printf '%s\n' "$raw_url"
+	fi
+}
+
+normalize_custom_mirror_url() {
+	local url="$1"
+
+	url="$(trim_value "$url")"
+	[ -n "$url" ] || return 0
+	case "$url" in
+		http://*|https://*) ;;
+		*) return 0 ;;
+	esac
+	printf '%s\n' "$url" | sed 's#/*$#/#'
+}
+
+normalize_release_tag() {
+	local tag="$1"
+	tag="$(trim_value "$tag")"
+	tag="${tag#v}"
+	tag="${tag#V}"
+	echo "$tag"
+}
+
+normalize_download_mirror() {
+	local mirror="$1"
+
+	mirror="$(trim_value "$mirror" | tr 'A-Z' 'a-z')"
+	case "$mirror" in
+		auto|cn|china|domestic|''|gh-proxy|ghproxy|proxy)
+		if [ "$mirror" = "gh-proxy" ] || [ "$mirror" = "ghproxy" ] || [ "$mirror" = "proxy" ]; then
+			echo "gh-proxy"
+		else
+			echo "auto"
+		fi
+		;;
+		github)
+			echo "github"
+		;;
+		custom)
+			echo "custom"
+		;;
+		gitee|gitlab|cloudflare)
+			echo "$mirror"
+		;;
+		*)
+			echo "auto"
+		;;
+	esac
+}
+
+repo_to_mirror_project() {
+	local repo="$1"
+
+	repo="$(trim_value "$repo")"
+	case "$repo" in
+		vnt-dev/vnt)
+			echo "vnt"
+			return 0
+		;;
+	esac
+
+	return 1
+}
+
+select_download_mirror() {
+	local repo="$1"
+	local mirror="$2"
+	local candidate
+
+	for candidate in $(get_download_mirror_candidates "$repo" "$mirror"); do
+		echo "$candidate"
+		return 0
+	done
+
+	echo "github"
+}
+
+get_download_mirror_candidates() {
+	local repo="$1"
+	local mirror="$2"
+
+	[ -n "$repo" ] || repo="vnt-dev/vnt"
+	mirror="$(normalize_download_mirror "$mirror")"
+
+	case "$mirror" in
+		auto)
+			printf '%s\n' "gh-proxy" "github" "gitee" "gitlab" "cloudflare"
+		;;
+		gh-proxy)
+			printf '%s\n' "gh-proxy" "github"
+		;;
+		github)
+			echo "github"
+		;;
+		custom)
+			printf '%s\n' "custom" "github"
+		;;
+		gitee|gitlab|cloudflare)
+			printf '%s\n' "$mirror" "github"
+		;;
+		*)
+			printf '%s\n' "gh-proxy" "github"
+		;;
+	esac
+}
+
+get_download_mirror_cache_key() {
+	local repo="$1"
+	local mirror="$2"
+	local custom_mirror_url="$3"
+
+	mirror="$(normalize_download_mirror "$mirror")"
+	case "$mirror" in
+		auto)
+			echo "auto"
+		;;
+		gh-proxy)
+			echo "gh-proxy"
+		;;
+		github)
+			echo "github"
+		;;
+		custom)
+			custom_mirror_url="$(normalize_custom_mirror_url "$custom_mirror_url")"
+			if [ -n "$custom_mirror_url" ]; then
+				echo "custom_$(sanitize_name "$custom_mirror_url")"
+			else
+				echo "custom"
+			fi
+		;;
+		gitee|gitlab|cloudflare)
+			echo "$mirror"
+		;;
+		*)
+			echo "$mirror"
+		;;
+	esac
+}
+
+get_release_api_candidates() {
+	local repo="$1"
+	local tag="$2"
+	local mirror="$3"
+	local normalized_tag effective_mirror project
+
+	[ "$repo" = "$VNT2_FIXED_REPO" ] || return 1
+	normalized_tag="$(normalize_release_tag "$tag")"
+	[ "$normalized_tag" = "$VNT2_FIXED_VERSION" ] || return 1
+	effective_mirror="$(select_download_mirror "$repo" "$mirror")"
+
+	case "$effective_mirror" in
+		gitee|gitlab|cloudflare)
+			project="$(repo_to_mirror_project "$repo")" || effective_mirror="github"
+			if [ "$effective_mirror" != "github" ]; then
+				case "$effective_mirror" in
+					gitee)
+						echo "https://gitee.com/api/v5/repos/whzhni/${project}/releases"
+					;;
+					gitlab)
+						echo "https://gitlab.com/api/v4/projects/whzhni%2F${project}/releases"
+					;;
+					cloudflare)
+						echo "https://pub-8a57d35d70d5423aac22a3316867e7ce.r2.dev/${project}/releases"
+					;;
+				 esac
+				return 0
+			fi
+		;;
+	esac
+
+	echo "https://api.github.com/repos/${repo}/releases/tags/${normalized_tag}"
+	echo "https://api.github.com/repos/${repo}/releases/tags/v${normalized_tag}"
+}
+
+extract_release_urls() {
+	local json_file="$1"
+
+	grep -o 'https://[^"]*' "$json_file" 2>/dev/null | \
+		sed 's#\\/#/#g' | awk 'NF && !seen[$0]++'
+}
+
+extract_release_object_by_tag() {
+	local src="$1"
+	local dst="$2"
+	local wanted_tag="$3"
+
+	awk -v wanted="$wanted_tag" '
+BEGIN {
+	sub(/^[vV]/, "", wanted)
+	in_array = 0
+	depth = 0
+	started = 0
+	in_string = 0
+	escaped = 0
+	out = ""
+}
+{
+	line = $0
+	if (!in_array) {
+		pos = index(line, "[")
+		if (pos > 0) {
+			in_array = 1
+			line = substr(line, pos + 1)
+		} else {
+			next
+		}
+	}
+	for (i = 1; i <= length(line); i++) {
+		c = substr(line, i, 1)
+		if (!started) {
+			if (c == "{") {
+				started = 1
+				depth = 1
+				out = "{"
+			}
+			continue
+		}
+		out = out c
+		if (in_string) {
+			if (escaped) {
+				escaped = 0
+			} else if (c == "\\") {
+				escaped = 1
+			} else if (c == "\"") {
+				in_string = 0
+			}
+			continue
+		}
+		if (c == "\"") {
+			in_string = 1
+		} else if (c == "{") {
+			depth++
+		} else if (c == "}") {
+			depth--
+			if (depth == 0) {
+				tag = out
+				if (sub(/^.*"tag_name"[[:space:]]*:[[:space:]]*"/, "", tag)) {
+					sub(/".*$/, "", tag)
+					sub(/^[vV]/, "", tag)
+				}
+				if (tag == wanted) {
+					print out
+					exit
+				}
+				started = 0
+				in_string = 0
+				escaped = 0
+				out = ""
+			}
+		}
+	}
+}
+' "$src" >"$dst"
+
+	[ -s "$dst" ]
+}
+
+fetch_release_metadata_from_mirror() {
+	local repo="$1"
+	local tag="$2"
+	local json_file="$3"
+	local mirror="$4"
+	local custom_mirror_url="$5"
+	local api_url response_tag candidate requested_tag effective_mirror tagged_file json_root
+
+	[ "$repo" = "$VNT2_FIXED_REPO" ] || return 1
+	[ "$(normalize_release_tag "$tag")" = "$VNT2_FIXED_VERSION" ] || return 1
+	effective_mirror="$(select_download_mirror "$repo" "$mirror")"
+	requested_tag="$(normalize_release_tag "$tag")"
+
+	for candidate in $(get_release_api_candidates "$repo" "$tag" "$effective_mirror"); do
+		log_download "checking release endpoint: ${candidate}"
+		if download_file "$candidate" "$json_file" "api" "$effective_mirror" "$custom_mirror_url"; then
+			response_tag="$(sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$json_file" | head -n1)"
+			response_tag="$(normalize_release_tag "$response_tag")"
+			case "$candidate" in
+				*/releases)
+						json_root="$(sed -n 's/^[[:space:]]*\([{[]\).*/\1/p' "$json_file" | head -n1)"
+						if [ "$json_root" = "[" ] && [ -n "$requested_tag" ]; then
+							tagged_file="${json_file}.tagged"
+							if extract_release_object_by_tag "$json_file" "$tagged_file" "$requested_tag"; then
+								mv -f "$tagged_file" "$json_file"
+							else
+								rm -f "$tagged_file"
+								continue
+							fi
+						fi
+					if [ -s "$json_file" ]; then
+						response_tag="$(sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$json_file" | head -n1)"
+						response_tag="$(normalize_release_tag "$response_tag")"
+					fi
+				;;
+			esac
+			if [ "$response_tag" = "$VNT2_FIXED_VERSION" ]; then
+				echo "$candidate"
+				return 0
+			fi
+		fi
+	done
+
+	return 1
+}
+
+get_release_asset_name_candidates() {
+	local scope="$1"
+	local version="$2"
+	local arch_name="$3"
+	local prefix suffix
+
+	version="$(normalize_release_tag "$version")"
+	[ "$version" = "$VNT2_FIXED_VERSION" ] || return 1
+
+	case "$scope" in
+		cli)
+			prefix="vnt2"
+			suffix=".zip"
+		;;
+		*)
+			return 1
+		;;
+	esac
+
+	case "$arch_name" in
+		x86_64)
+			echo "${prefix}-x86_64-unknown-linux-musl-v${version}${suffix}"
+		;;
+		aarch64)
+			echo "${prefix}-aarch64-unknown-linux-musl-v${version}${suffix}"
+		;;
+		armv7-musleabihf)
+			echo "${prefix}-armv7-unknown-linux-musleabihf-v${version}${suffix}"
+		;;
+		armv7-musleabi)
+			echo "${prefix}-armv7-unknown-linux-musleabi-v${version}${suffix}"
+		;;
+		arm-musleabihf)
+			echo "${prefix}-arm-unknown-linux-musleabihf-v${version}${suffix}"
+		;;
+		arm-musleabi)
+			echo "${prefix}-arm-unknown-linux-musleabi-v${version}${suffix}"
+		;;
+		mipsel)
+			echo "${prefix}-mipsel-unknown-linux-musl-v${version}${suffix}"
+		;;
+		mips)
+			echo "${prefix}-mips-unknown-linux-musl-v${version}${suffix}"
+		;;
+		*)
+			return 1
+		;;
+	esac
+}
+
+get_release_asset_url() {
+	local repo="$1"
+	local scope="$2"
+	local version="$3"
+	local arch_name="$4"
+	local asset_name
+
+	[ "$repo" = "$VNT2_FIXED_REPO" ] || return 1
+	[ "$(normalize_release_tag "$version")" = "$VNT2_FIXED_VERSION" ] || return 1
+	asset_name="$(get_release_asset_name_candidates "$scope" "$version" "$arch_name" | head -n1)"
+	[ -n "$asset_name" ] || return 1
+	echo "https://github.com/${repo}/releases/download/v${version}/${asset_name}"
+}
+
+select_release_asset() {
+	local json_file="$1"
+	local scope="$2"
+	local version="$3"
+	local arch_name="$4"
+	local urls url filename expected
+
+	urls="$(extract_release_urls "$json_file")"
+	[ -n "$urls" ] || return 1
+
+	for expected in $(get_release_asset_name_candidates "$scope" "$version" "$arch_name"); do
+		while IFS= read -r url; do
+			filename="${url##*/}"
+			filename="${filename%%\?*}"
+			if [ "$filename" = "$expected" ]; then
+				echo "$url"
+				return 0
+			fi
+		done <<EOF
+$urls
+EOF
+	done
+
+	return 1
+}
+
+extract_zip_asset() {
+	local asset_file="$1"
+	local dest_dir="$2"
+
+	if command -v unzip >/dev/null 2>&1; then
+		unzip -qo "$asset_file" -d "$dest_dir" >/dev/null 2>&1 && return 0
+	fi
+
+	if command -v busybox >/dev/null 2>&1; then
+		busybox unzip -o "$asset_file" -d "$dest_dir" >/dev/null 2>&1 && return 0
+	fi
+
+	if command -v bsdtar >/dev/null 2>&1; then
+		bsdtar -xf "$asset_file" -C "$dest_dir" >/dev/null 2>&1 && return 0
+	fi
+
+	if tar -tf "$asset_file" >/dev/null 2>&1; then
+		tar -xf "$asset_file" -C "$dest_dir" >/dev/null 2>&1 && return 0
+	fi
+
+	return 1
+}
+
+archive_paths_are_safe() {
+	awk '
+BEGIN { bad = 0 }
+{
+	entry = $0
+	gsub(/\\/, "/", entry)
+	sub(/^\.\//, "", entry)
+	if (entry ~ /^\// || entry ~ /^[A-Za-z]:\// || entry == ".." ||
+		entry ~ /^\.\.\// || entry ~ /\/\.\.\// || entry ~ /\/\.\.$/) {
+		bad = 1
+	}
+}
+END { exit bad }
+'
+}
+
+archive_is_safe() {
+	local asset_file="$1"
+	local entries details
+
+	case "$asset_file" in
+		*.tar.gz|*.tgz)
+			entries="$(tar -tzf "$asset_file" 2>/dev/null)" || return 1
+			printf '%s\n' "$entries" | archive_paths_are_safe || return 1
+			details="$(tar -tvzf "$asset_file" 2>/dev/null)" || return 1
+			printf '%s\n' "$details" | awk '
+				{ type = substr($0, 1, 1); if (type != "-" && type != "d") bad = 1 }
+				END { exit bad }
+			' || return 1
+		;;
+		*.tar.xz)
+			entries="$(tar -tJf "$asset_file" 2>/dev/null)" || return 1
+			printf '%s\n' "$entries" | archive_paths_are_safe || return 1
+			details="$(tar -tvJf "$asset_file" 2>/dev/null)" || return 1
+			printf '%s\n' "$details" | awk '
+				{ type = substr($0, 1, 1); if (type != "-" && type != "d") bad = 1 }
+				END { exit bad }
+			' || return 1
+		;;
+		*.zip)
+			if command -v unzip >/dev/null 2>&1; then
+				entries="$(unzip -Z1 "$asset_file" 2>/dev/null)" || return 1
+				printf '%s\n' "$entries" | archive_paths_are_safe || return 1
+				details="$(unzip -Z -l "$asset_file" 2>/dev/null)" || return 1
+				printf '%s\n' "$details" | awk '
+					$1 ~ /^l/ { bad = 1 }
+					END { exit bad }
+				' || return 1
+			elif command -v bsdtar >/dev/null 2>&1; then
+				entries="$(bsdtar -tf "$asset_file" 2>/dev/null)" || return 1
+				printf '%s\n' "$entries" | archive_paths_are_safe || return 1
+				details="$(bsdtar -tvf "$asset_file" 2>/dev/null)" || return 1
+				printf '%s\n' "$details" | awk '
+					{ type = substr($0, 1, 1); if (type != "-" && type != "d") bad = 1 }
+					END { exit bad }
+				' || return 1
+			else
+				# BusyBox unzip cannot list entries without extracting them safely.
+				return 1
+			fi
+		;;
+	esac
+
+	return 0
+}
+
+validate_asset_file() {
+	local asset_file="$1"
+
+	[ -s "$asset_file" ] || return 1
+
+	case "$asset_file" in
+		*.zip)
+			if command -v unzip >/dev/null 2>&1; then
+				unzip -t "$asset_file" >/dev/null 2>&1 && return 0
+			fi
+			if command -v busybox >/dev/null 2>&1; then
+				busybox unzip -t "$asset_file" >/dev/null 2>&1 && return 0
+			fi
+			if command -v bsdtar >/dev/null 2>&1; then
+				bsdtar -tf "$asset_file" >/dev/null 2>&1 && return 0
+			fi
+			return 1
+		;;
+		*.tar.gz|*.tgz)
+			tar -tzf "$asset_file" >/dev/null 2>&1
+			return $?
+		;;
+		*.tar.xz)
+			tar -tJf "$asset_file" >/dev/null 2>&1
+			return $?
+		;;
+		*)
+			return 0
+		;;
+	esac
+}
+
+validate_release_asset() {
+	local asset_file="$1"
+
+	validate_asset_file "$asset_file" || return 1
+	return 0
+}
+
+extract_release_asset() {
+	local asset_file="$1"
+	local dest_dir="$2"
+	local base
+
+	archive_is_safe "$asset_file" || return 1
+
+	rm -rf "$dest_dir"
+	mkdir -p "$dest_dir"
+
+	case "$asset_file" in
+		*.tar.gz|*.tgz)
+			tar -xzf "$asset_file" -C "$dest_dir" >/dev/null 2>&1 || return 1
+		;;
+		*.tar.xz)
+			tar -xJf "$asset_file" -C "$dest_dir" >/dev/null 2>&1 || return 1
+		;;
+		*.zip)
+			extract_zip_asset "$asset_file" "$dest_dir" || return 1
+		;;
+		*)
+			base="$(basename "$asset_file")"
+			cp -f "$asset_file" "${dest_dir}/${base}" >/dev/null 2>&1 || return 1
+		;;
+	esac
+}
+
+locate_extracted_bin() {
+	local root="$1"
+	local name="$2"
+	local alt_dash alt_under found
+
+	alt_dash="$(printf '%s' "$name" | tr '_' '-')"
+	alt_under="$(printf '%s' "$name" | tr '-' '_')"
+
+	found="$(
+		find "$root" -type f \
+			\( \
+				-name "$name" -o \
+				-name "${name}.bin" -o \
+				-name "$alt_dash" -o \
+				-name "${alt_dash}.bin" -o \
+				-name "$alt_under" -o \
+				-name "${alt_under}.bin" -o \
+				-name "${name}-*" -o \
+				-name "${name}_*" -o \
+				-name "${alt_dash}-*" -o \
+				-name "${alt_dash}_*" -o \
+				-name "${alt_under}-*" -o \
+				-name "${alt_under}_*" \
+			\) 2>/dev/null | head -n1
+	)"
+	[ -n "$found" ] && {
+		echo "$found"
+		return 0
+	}
+
+	return 1
+}
+
+
+install_binary_to_usrbin() {
+	local src="$1"
+	local target_name="$2"
+	local target_path temp_path
+
+	[ -n "$src" ] || return 1
+	[ -f "$src" ] || return 1
+	[ -n "$target_name" ] || return 1
+	target_path="${INSTALL_BIN_DIR}/${target_name}"
+	temp_path="${target_path}.$$"
+
+	mkdir -p "${INSTALL_BIN_DIR}" >/dev/null 2>&1 || {
+		log_download "failed to create install directory ${INSTALL_BIN_DIR}"
+		return 1
+	}
+	rm -f "$temp_path" >/dev/null 2>&1
+	cp -f "$src" "$temp_path" >/dev/null 2>&1 || {
+		log_download "failed to copy binary to ${target_path} from ${src}"
+		rm -f "$temp_path" >/dev/null 2>&1
+		return 1
+	}
+	chmod 755 "$temp_path" >/dev/null 2>&1 || {
+		log_download "failed to chmod binary ${target_path}"
+		rm -f "$temp_path" >/dev/null 2>&1
+		return 1
+	}
+	is_elf_binary "$temp_path" || {
+		log_download "installed binary is not a valid ELF file ${target_path}"
+		rm -f "$temp_path" >/dev/null 2>&1
+		return 1
+	}
+	mv -f "$temp_path" "$target_path" >/dev/null 2>&1 || {
+		log_download "failed to atomically replace installed binary ${target_path}"
+		rm -f "$temp_path" >/dev/null 2>&1
+		return 1
+	}
+	[ -f "$target_path" ] || {
+		log_download "binary not found after install ${target_path}"
+		return 1
+	}
+	echo "$target_path"
+	return 0
+}
+
+install_bundle_to_usrbin() {
+	local extracted_dir="$1"
+	local cli_bin ctrl_bin
+
+	cli_bin="$(locate_extracted_bin "$extracted_dir" "vnt2_cli")" || return 1
+	ensure_elf_exec "$cli_bin" || return 1
+	install_binary_to_usrbin "$cli_bin" "vnt2_cli" >/dev/null || return 1
+
+	ctrl_bin="$(locate_extracted_bin "$extracted_dir" "vnt2_ctrl")" || return 1
+	ensure_elf_exec "$ctrl_bin" || return 1
+	install_binary_to_usrbin "$ctrl_bin" "vnt2_ctrl" >/dev/null || return 1
+
+	return 0
+}
+
+cache_bundle_ready() {
+	local extracted_dir="$1"
+
+	ensure_elf_exec "$(locate_extracted_bin "$extracted_dir" "vnt2_cli")" || return 1
+	ensure_elf_exec "$(locate_extracted_bin "$extracted_dir" "vnt2_ctrl")"
+}
+
+auto_download_bundle_for_mode() {
+	local cfg="$1"
+	local scope="$2"
+	local state_file="$3"
+
+	local auto_download download_tag download_repo download_mirror custom_mirror_url cache_mirror_key candidate_mirror api_url arch_name
+	local mirror_attempt mirror_retry_limit
+	local cache_key cache_dir query_dir json_file release_tag asset_url asset_name asset_file extracted_dir
+	local fallback_version fallback_url asset_size
+	local cli_bin ctrl_bin
+	asset_name=""
+
+	config_get_bool auto_download "$cfg" "auto_download" "1"
+	[ "$auto_download" = "1" ] || {
+		write_download_state "$state_file" "disabled" "auto download disabled" "" "" "" ""
+		return 1
+	}
+
+	case "$scope" in
+		cli)
+			download_tag="$VNT2_FIXED_VERSION"
+			download_repo="$VNT2_FIXED_REPO"
+			config_get download_mirror "$cfg" "download_mirror" "auto"
+			config_get custom_mirror_url "$cfg" "custom_download_mirror" ""
+		;;
+		*)
+			return 1
+		;;
+	esac
+	download_mirror="$(normalize_download_mirror "$download_mirror")"
+	custom_mirror_url="$(normalize_custom_mirror_url "$custom_mirror_url")"
+	cache_mirror_key="$(get_download_mirror_cache_key "$download_repo" "$download_mirror" "$custom_mirror_url")"
+
+	arch_name="$(detect_arch_name)"
+	case "$arch_name" in
+		x86_64|aarch64|armv7-musleabihf|armv7-musleabi|arm-musleabihf|arm-musleabi|mips|mipsel)
+			;;
+		*)
+			log_download "unsupported device architecture: ${arch_name:-unknown}"
+			write_download_state "$state_file" "failed" "unsupported device architecture" "" "$download_tag" "${arch_name:-unknown}" ""
+			return 1
+		;;
+	esac
+	query_dir="${DOWNLOAD_CACHE_BASE}/query_$(sanitize_name "${cache_mirror_key}_${download_repo}_${download_tag}_${arch_name}_${scope}")"
+	json_file="${query_dir}/release.json"
+	mkdir -p "$query_dir"
+
+	log_download "query fixed release repo=${download_repo} tag=${download_tag} arch=${arch_name} scope=${scope}"
+	for candidate_mirror in $(get_download_mirror_candidates "$download_repo" "$download_mirror"); do
+		mirror_retry_limit="$DOWNLOAD_MIRROR_RETRIES"
+		[ "$candidate_mirror" = "custom" ] && mirror_retry_limit=1
+		for mirror_attempt in $(seq 1 "$mirror_retry_limit"); do
+			log_download "mirror attempt ${mirror_attempt}/${mirror_retry_limit} mirror=${candidate_mirror} scope=${scope}"
+			write_download_state "$state_file" "querying" "querying releases (${candidate_mirror})" "" "$download_tag" "$arch_name" ""
+			log_download "querying ${scope} release repo=${download_repo} tag=${download_tag} mirror=${candidate_mirror} strategy=${download_mirror} arch=${arch_name}"
+			api_url="$(fetch_release_metadata_from_mirror "$download_repo" "$download_tag" "$json_file" "$candidate_mirror" "$custom_mirror_url")"
+			if [ -z "$api_url" ]; then
+				log_download "release query failed repo=${download_repo} tag=${download_tag} mirror=${candidate_mirror}"
+				if [ "$candidate_mirror" != "github" ]; then
+					continue
+				fi
+				fallback_version="$VNT2_FIXED_VERSION"
+				fallback_url="$(get_release_asset_url "$download_repo" "$scope" "$fallback_version" "$arch_name" 2>/dev/null)"
+				if [ -z "$fallback_url" ]; then
+					continue
+				fi
+				cat >"$json_file" <<EOF
+{"tag_name":"v${fallback_version}","assets":[{"browser_download_url":"${fallback_url}"}]}
+EOF
+				api_url="fallback:${fallback_url}"
+				log_download "using built-in release fallback repo=${download_repo} tag=${fallback_version} asset_url=${fallback_url}"
+			fi
+
+			log_download "release query ok: ${api_url} used_url=${DOWNLOAD_LAST_URL:-unknown} mirror=${candidate_mirror}"
+			release_tag="$(sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$json_file" | head -n1)"
+			release_tag="$(normalize_release_tag "$release_tag")"
+			[ "$release_tag" = "$VNT2_FIXED_VERSION" ] || {
+				log_download "release metadata tag mismatch expected=${VNT2_FIXED_VERSION} mirror=${candidate_mirror}"
+				continue
+			}
+			cache_key="$(sanitize_name "${cache_mirror_key}_${candidate_mirror}_${download_repo}_${release_tag}_${arch_name}_${scope}")"
+			cache_dir="${DOWNLOAD_CACHE_BASE}/${cache_key}"
+			extracted_dir="${cache_dir}/extracted"
+			mkdir -p "$cache_dir"
+			cp -f "$json_file" "${cache_dir}/release.json" >/dev/null 2>&1
+
+			asset_url="$(select_release_asset "$json_file" "$scope" "$release_tag" "$arch_name")" || {
+				log_download "no release asset matched arch=${arch_name} scope=${scope} mirror=${candidate_mirror}"
+				continue
+			}
+
+			asset_name="$(basename "$asset_url")"
+			asset_file="${cache_dir}/${asset_name}"
+			write_download_state "$state_file" "downloading" "downloading release asset (${candidate_mirror})" "$asset_name" "$release_tag" "$arch_name" ""
+			log_download "selected asset ${asset_name} mirror=${candidate_mirror} url=${asset_url}"
+
+			if cache_bundle_ready "$extracted_dir"; then
+				log_download "cached bundle found, reuse ${extracted_dir} mirror=${candidate_mirror}"
+				write_download_state "$state_file" "cached" "reusing local cached bundle" "$(basename "$cache_dir")" "$release_tag" "$arch_name" "$extracted_dir"
+				if install_bundle_to_usrbin "$extracted_dir"; then
+					write_version_state "$release_tag" "download-cache" "$arch_name" "$asset_name" "${INSTALL_BIN_DIR}/vnt2_cli" "${INSTALL_BIN_DIR}/vnt2_ctrl" || \
+						log_download "failed to persist version state for cached bundle tag=${release_tag}"
+					uci -q set "${CONF}.${cfg}.vnt2_cli_bin=${INSTALL_BIN_DIR}/vnt2_cli"
+					uci -q set "${CONF}.${cfg}.vnt2_ctrl_bin=${INSTALL_BIN_DIR}/vnt2_ctrl"
+					uci commit "$CONF" >/dev/null 2>&1
+					return 0
+				fi
+			fi
+
+			if [ -s "$asset_file" ]; then
+				if validate_release_asset "$asset_file"; then
+					log_download "reusing downloaded asset ${asset_file}"
+				else
+					log_download "cached asset invalid, remove and redownload ${asset_file}"
+					rm -f "$asset_file"
+				fi
+			fi
+
+			if [ ! -s "$asset_file" ]; then
+				log_download "asset download started tool=$(get_downloader asset 2>/dev/null || echo unknown) timeout=180s mirror=${candidate_mirror} file=${asset_name}"
+				if ! download_file "$asset_url" "$asset_file" "asset" "$candidate_mirror" "$custom_mirror_url"; then
+					log_download "asset download failed tool=${DOWNLOAD_LAST_TOOL:-unknown} rc=${DOWNLOAD_LAST_RC:-unknown} received=${DOWNLOAD_LAST_BYTES:-0}B mirror=${candidate_mirror} used_url=${DOWNLOAD_LAST_URL:-unknown}"
+					rm -f "$asset_file"
+					break
+				fi
+				if ! validate_release_asset "$asset_file"; then
+					asset_size="$(file_size "$asset_file" 2>/dev/null || echo 0)"
+					log_download "downloaded release asset invalid or corrupted scope=${scope} file=${asset_file} size=${asset_size}B mirror=${candidate_mirror}"
+					rm -f "$asset_file"
+					break
+				fi
+				log_download "asset download ok tool=${DOWNLOAD_LAST_TOOL:-unknown} used_url=${DOWNLOAD_LAST_URL:-unknown} mirror=${candidate_mirror} file=${asset_file}"
+			fi
+
+			write_download_state "$state_file" "extracting" "extracting program files (${candidate_mirror})" "$asset_name" "$release_tag" "$arch_name" ""
+			if ! extract_release_asset "$asset_file" "$extracted_dir"; then
+				log_download "extract failed, remove cache and switch mirror ${candidate_mirror} ${asset_file}"
+				rm -rf "$extracted_dir"
+				rm -f "$asset_file"
+				break
+			fi
+
+			cli_bin="$(locate_extracted_bin "$extracted_dir" "vnt2_cli")"
+			if [ -z "$cli_bin" ] || [ ! -f "$cli_bin" ]; then
+				log_download "bundle missing vnt2_cli mirror=${candidate_mirror}"
+				rm -rf "$extracted_dir"
+				continue
+			fi
+			ctrl_bin="$(locate_extracted_bin "$extracted_dir" "vnt2_ctrl")"
+			if [ -z "$ctrl_bin" ] || [ ! -f "$ctrl_bin" ]; then
+				log_download "bundle missing vnt2_ctrl mirror=${candidate_mirror}"
+				rm -rf "$extracted_dir"
+				continue
+			fi
+			if ! ensure_elf_exec "$cli_bin" || ! ensure_elf_exec "$ctrl_bin"; then
+				log_download "bundle binaries are not valid ELF files mirror=${candidate_mirror}"
+				rm -rf "$extracted_dir"
+				continue
+			fi
+			if ! install_bundle_to_usrbin "$extracted_dir"; then
+				log_download "install bundle to /usr/bin failed"
+				write_download_state "$state_file" "failed" "install bundle to /usr/bin failed" "$asset_name" "$release_tag" "$arch_name" ""
+				return 1
+			fi
+			uci -q set "${CONF}.${cfg}.vnt2_cli_bin=${INSTALL_BIN_DIR}/vnt2_cli"
+			uci -q set "${CONF}.${cfg}.vnt2_ctrl_bin=${INSTALL_BIN_DIR}/vnt2_ctrl"
+			uci commit "$CONF" >/dev/null 2>&1
+			log_download "bundle installed: cli=${INSTALL_BIN_DIR}/vnt2_cli ctrl=${INSTALL_BIN_DIR}/vnt2_ctrl mirror=${candidate_mirror} url=${asset_url}"
+			write_download_state "$state_file" "success" "installed vnt2_cli and vnt2_ctrl to /usr/bin" "$asset_name" "$release_tag" "$arch_name" "${INSTALL_BIN_DIR}/vnt2_cli"
+			write_version_state "$release_tag" "download" "$arch_name" "$asset_name" "${INSTALL_BIN_DIR}/vnt2_cli" "${INSTALL_BIN_DIR}/vnt2_ctrl" || \
+				log_download "failed to persist version state tag=${release_tag}"
+			return 0
+		done
+	done
+
+	write_download_state "$state_file" "failed" "all download mirrors failed" "${asset_name:-unknown}" "$download_tag" "$arch_name" ""
+	log_download "all download mirrors failed repo=${download_repo} tag=${download_tag} strategy=${download_mirror} arch=${arch_name} scope=${scope}"
+	return 1
+}
+
+auto_download_bundle() {
+	local cfg="$1"
+	local scope="$2"
+	local state_file="$3"
+	local auto_download
+
+	config_get_bool auto_download "$cfg" "auto_download" "1"
+	[ "$auto_download" = "1" ] || {
+		write_download_state "$state_file" "disabled" "auto download disabled" "" "" "" ""
+		return 1
+	}
+
+	auto_download_bundle_for_mode "$cfg" "$scope" "$state_file"
+}
+
+prepare_binary() {
+	local cfg="$1"
+	local option="$2"
+	local default_path="$3"
+	local upload_name="$4"
+	local state_file="$5"
+	local scope="$6"
+
+	local bin managed_binary_needs_update=0 auto_download
+	config_get bin "$cfg" "$option" "$default_path"
+
+	case "$scope" in
+		cli)
+			if ensure_elf_exec "$bin"; then
+				if fixed_binary_state_matches "$bin"; then
+					echo "$bin"
+					return 0
+				fi
+				config_get_bool auto_download "$cfg" "auto_download" "1"
+				if [ "$auto_download" = "1" ]; then
+					managed_binary_needs_update=1
+					log_download "installed ${scope} binary is not the fixed version ${VNT2_FIXED_VERSION}, attempting replacement"
+				else
+					echo "$bin"
+					return 0
+				fi
+			fi
+		;;
+		*)
+			return 1
+		;;
+	esac
+
+	if auto_download_bundle "$cfg" "$scope" "$state_file"; then
+		bin="$(uci -q get "${CONF}.${cfg}.${option}")"
+		if ensure_elf_exec "$bin"; then
+			echo "$bin"
+			return 0
+		fi
+	fi
+
+	# Manual uploads are staged by LuCI and installed asynchronously by
+	# /usr/libexec/vnt2/upload-worker, which also points vnt2_cli_bin at
+	# /usr/bin/vnt2_cli. When automatic download fails, fall back to that
+	# already installed upload instead of reading stale files from /tmp.
+	config_get bin "$cfg" "$option" "$default_path"
+	if ensure_elf_exec "$bin"; then
+		if [ "$managed_binary_needs_update" = "1" ]; then
+			log_download "${scope} fixed-version download failed, fallback to installed binary ${bin}"
+		else
+			log_download "${scope} auto download failed, fallback to installed binary ${bin}"
+		fi
+		write_download_state "$state_file" "fallback" "fixed-version download failed, using installed binary" "$(basename "$bin")" "" "$(detect_arch_name)" "$bin"
+		echo "$bin"
+		return 0
+	fi
+
+	return 1
+}
+
+toml_get_raw() {
+	local file="$1"
+	local key="$2"
+	local raw
+	[ -f "$file" ] || return 1
+	raw="$(sed -n "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*//p" "$file" | head -n1)"
+	# TOML accepts inline comments and either quoting style. Normalize both so
+	# device_mode values written as `'tun' # comment` are not misread as a
+	# configuration without a virtual device.
+	printf '%s\n' "$raw" | awk '
+		BEGIN { dq = sprintf("%c", 34); sq = sprintf("%c", 39); bs = sprintf("%c", 92) }
+		{
+			out = ""
+			quote = ""
+			escaped = 0
+			for (i = 1; i <= length($0); i++) {
+				c = substr($0, i, 1)
+				if (quote != "") {
+					out = out c
+					if (quote == dq && escaped) {
+						escaped = 0
+					} else if (quote == dq && c == bs) {
+						escaped = 1
+					} else if (c == quote) {
+						quote = ""
+					}
+				} else if (c == dq || c == sq) {
+					quote = c
+					out = out c
+				} else if (c == "#") {
+					break
+				} else {
+					out = out c
+				}
+			}
+			sub(/[ 	]+$/, "", out)
+			print out
+		}
+	'
+}
+
+toml_get_string() {
+	local file="$1"
+	local key="$2"
+	local raw val
+
+	raw="$(toml_get_raw "$file" "$key" 2>/dev/null)"
+	raw="$(trim_value "$raw")"
+	case "$raw" in
+		\"*\")
+			val="${raw#\"}"
+			val="${val%\"}"
+			printf '%s\n' "$val" | sed 's/\\"/"/g; s/\\\\/\\/g'
+		;;
+		*)
+			printf '%s\n' "$raw"
+		;;
+	esac
+}
+
+toml_get_bool() {
+	local file="$1"
+	local key="$2"
+	local raw
+	raw="$(trim_value "$(toml_get_raw "$file" "$key" 2>/dev/null)")"
+	[ "$raw" = "true" ] && echo "1" || echo "0"
+}
+
+toml_strip_quotes() {
+	printf '%s\n' "$1" | awk '
+		BEGIN { dq = sprintf("%c", 34); sq = sprintf("%c", 39); bs = sprintf("%c", 92) }
+		{
+			s = $0
+			if (length(s) >= 2) {
+				first = substr(s, 1, 1)
+				last = substr(s, length(s), 1)
+				if ((first == dq && last == dq) || (first == sq && last == sq)) {
+					s = substr(s, 2, length(s) - 2)
+				}
+			}
+			print s
+		}
+	'
+}
+
+toml_get_value() {
+	local file="$1"
+	local key="$2"
+	local raw
+
+	# toml_get_raw already removes unquoted inline comments. Strip either TOML
+	# quoting style here so script users can write 'tun' or "tun" identically.
+	raw="$(toml_get_raw "$file" "$key" 2>/dev/null)"
+	raw="$(trim_value "$raw")"
+	toml_strip_quotes "$raw"
+}
+
+toml_validate_client_config() {
+	local file="$1"
+	local network_code subscription
+
+	[ -f "$file" ] || {
+		log_service "client config file missing: ${file}"
+		return 1
+	}
+
+	network_code="$(trim_value "$(toml_get_value "$file" "network_code")")"
+	subscription="$(trim_value "$(toml_get_value "$file" "subscription")")"
+
+	[ -n "$network_code" ] || [ -n "$subscription" ] || {
+		log_service "client config missing network_code and subscription"
+		return 1
+	}
+
+	return 0
+}
+
+
+uci_set_if_changed() {
+	local key="$1"
+	local value="$2"
+	local current
+
+	current="$(uci -q get "$key" 2>/dev/null)" || current=""
+	[ "$current" = "$value" ] && return 0
+	uci set "${key}=${value}"
+}
+
+uci_delete_if_exists() {
+	local key="$1"
+
+	uci -q get "$key" >/dev/null 2>&1 || return 0
+	uci -q delete "$key"
+}
+
+apply_network_config_changes() {
+	local action="${1:-reload}"
+	local changed=0
+	local run_ifup=0
+
+	[ -n "$(uci changes network)" ] && changed=1
+	if [ "$changed" -eq 1 ]; then
+		uci commit network || return 1
+	fi
+
+	case "$action" in
+		ifup)
+			run_ifup="$changed"
+			if [ "$run_ifup" -eq 0 ] && command -v ifstatus >/dev/null 2>&1; then
+				ifstatus VNT2 2>/dev/null | grep -q '"up":[[:space:]]*true' || run_ifup=1
+			fi
+			[ "$run_ifup" -eq 1 ] || return 0
+			if command -v ifup >/dev/null 2>&1; then
+				ifup VNT2 >/dev/null 2>&1 || return 1
+			elif [ -x /sbin/ifup ]; then
+				/sbin/ifup VNT2 >/dev/null 2>&1 || return 1
+			else
+				return 1
+			fi
+		;;
+		reload)
+			if [ "$changed" -eq 1 ] && [ -x /etc/init.d/network ]; then
+				/etc/init.d/network reload >/dev/null 2>&1 || return 1
+			fi
+		;;
+		none) : ;;
+		*) return 1 ;;
+	esac
+	return 0
+}
+
+apply_firewall_config_changes() {
+	[ -n "$(uci changes firewall)" ] || return 0
+	uci commit firewall || return 1
+	[ -x /etc/init.d/firewall ] || return 0
+	/etc/init.d/firewall reload >/dev/null 2>&1 || return 1
+}
+
+configure_network() {
+	local tun_name="$1"
+	local forward_list="$2"
+	local no_nat="$3"
+	local lan_zone wan_zone
+
+	[ -n "$tun_name" ] || return 1
+	lan_zone="$(find_firewall_zone_name "lan" 2>/dev/null || true)"
+	wan_zone="$(find_firewall_zone_name "wan" 2>/dev/null || true)"
+
+	uci_set_if_changed network.VNT2 'interface' || return 1
+	uci_set_if_changed network.VNT2.proto 'none' || return 1
+	uci_set_if_changed network.VNT2.device "$tun_name" || return 1
+	uci_set_if_changed network.VNT2.ifname "$tun_name" || return 1
+
+	uci_set_if_changed firewall.vnt2zone 'zone' || return 1
+	uci_set_if_changed firewall.vnt2zone.name 'VNT2' || return 1
+	uci_set_if_changed firewall.vnt2zone.input 'ACCEPT' || return 1
+	uci_set_if_changed firewall.vnt2zone.output 'ACCEPT' || return 1
+	uci_set_if_changed firewall.vnt2zone.forward 'ACCEPT' || return 1
+	if [ "${no_nat:-0}" = "1" ]; then
+		uci_set_if_changed firewall.vnt2zone.masq '0' || return 1
+	else
+		uci_set_if_changed firewall.vnt2zone.masq '1' || return 1
+	fi
+	uci_set_if_changed firewall.vnt2zone.mtu_fix '1' || return 1
+	uci_set_if_changed firewall.vnt2zone.network 'VNT2' || return 1
+
+	case " $forward_list " in
+		*" vnt2fwlan "*)
+			if [ -n "$lan_zone" ]; then
+				uci_set_if_changed firewall.vnt2fwlan 'forwarding' || return 1
+				uci_set_if_changed firewall.vnt2fwlan.src 'VNT2' || return 1
+				uci_set_if_changed firewall.vnt2fwlan.dest "${lan_zone}" || return 1
+			else
+				uci_delete_if_exists firewall.vnt2fwlan || return 1
+			fi
+		;;
+		*)
+			uci_delete_if_exists firewall.vnt2fwlan || return 1
+		;;
+	esac
+
+	case " $forward_list " in
+		*" vnt2fwwan "*)
+			if [ -n "$wan_zone" ]; then
+				uci_set_if_changed firewall.vnt2fwwan 'forwarding' || return 1
+				uci_set_if_changed firewall.vnt2fwwan.src 'VNT2' || return 1
+				uci_set_if_changed firewall.vnt2fwwan.dest "${wan_zone}" || return 1
+			else
+				uci_delete_if_exists firewall.vnt2fwwan || return 1
+			fi
+		;;
+		*)
+			uci_delete_if_exists firewall.vnt2fwwan || return 1
+		;;
+	esac
+
+	case " $forward_list " in
+		*" lanfwvnt2 "*)
+			if [ -n "$lan_zone" ]; then
+				uci_set_if_changed firewall.lanfwvnt2 'forwarding' || return 1
+				uci_set_if_changed firewall.lanfwvnt2.src "${lan_zone}" || return 1
+				uci_set_if_changed firewall.lanfwvnt2.dest 'VNT2' || return 1
+			else
+				uci_delete_if_exists firewall.lanfwvnt2 || return 1
+			fi
+		;;
+		*)
+			uci_delete_if_exists firewall.lanfwvnt2 || return 1
+		;;
+	esac
+
+	case " $forward_list " in
+		*" wanfwvnt2 "*)
+			if [ -n "$wan_zone" ]; then
+				uci_set_if_changed firewall.wanfwvnt2 'forwarding' || return 1
+				uci_set_if_changed firewall.wanfwvnt2.src "${wan_zone}" || return 1
+				uci_set_if_changed firewall.wanfwvnt2.dest 'VNT2' || return 1
+			else
+				uci_delete_if_exists firewall.wanfwvnt2 || return 1
+			fi
+		;;
+		*)
+			uci_delete_if_exists firewall.wanfwvnt2 || return 1
+		;;
+	esac
+
+	apply_network_config_changes none || return 1
+	apply_firewall_config_changes || return 1
+	# no_nat=1 disables VNT's built-in NAT and asks the operating system to
+	# perform forwarding instead, so IPv4 forwarding must then be enabled.
+	if [ "${no_nat:-0}" = "1" ]; then
+		sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+	fi
+	if ! apply_network_config_changes ifup; then
+		log_service "network sync pending: ifup VNT2 failed for ${tun_name}"
+		return 1
+	fi
+	return 0
+}
+
+cleanup_network() {
+	if uci -q get network.VNT2 >/dev/null 2>&1; then
+		if command -v ifdown >/dev/null 2>&1; then
+			ifdown VNT2 >/dev/null 2>&1 || true
+		elif [ -x /sbin/ifdown ]; then
+			/sbin/ifdown VNT2 >/dev/null 2>&1 || true
+		fi
+	fi
+	uci_delete_if_exists network.VNT2 || return 1
+	uci_delete_if_exists firewall.vnt2zone || return 1
+	uci_delete_if_exists firewall.vnt2fwlan || return 1
+	uci_delete_if_exists firewall.vnt2fwwan || return 1
+	uci_delete_if_exists firewall.lanfwvnt2 || return 1
+	uci_delete_if_exists firewall.wanfwvnt2 || return 1
+	apply_network_config_changes none || return 1
+	apply_firewall_config_changes || return 1
+	return 0
+}
+
+is_safe_toml_name() {
+	local name="$1"
+
+	[ -n "$name" ] || return 1
+	case "$name" in
+		*..*|*/*|*\\*) return 1 ;;
+		*.toml) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+device_mode_matches_tun_flags() {
+	local mode="$1"
+	local flags="$2"
+
+	flags="$(trim_value "$flags")"
+	case "$flags" in
+		0x*|0X*)
+			case "${flags#??}" in ''|*[!0-9a-fA-F]*) return 1 ;; esac
+		;;
+		''|*[!0-9]*) return 1 ;;
+	esac
+	[ -n "$flags" ] || return 1
+
+	case "$mode" in
+		tun) [ $((flags & 3)) -eq 1 ] ;;
+		tap) [ $((flags & 3)) -eq 2 ] ;;
+		*) return 1 ;;
+	esac
+}
+
+device_mode_matches_link_details() {
+	local mode="$1"
+	local details="$2"
+
+	[ -n "$details" ] || return 1
+	case "$mode" in
+		tun)
+		case "$details" in
+			*"tun type tun"*|*"type tun"*|*"mode tun"*) return 0 ;;
+			*) return 1 ;;
+		esac
+		;;
+		tap)
+		case "$details" in
+			*"tun type tap"*|*"type tap"*|*"mode tap"*) return 0 ;;
+			*) return 1 ;;
+		esac
+		;;
+		*) return 1 ;;
+	esac
+}
+
+read_tun_device_type() {
+	local device="$1"
+	local flags details
+
+	[ -n "$device" ] || return 1
+	[ -d "${SYS_CLASS_NET}/${device}" ] || return 1
+
+	# tun_flags is the authoritative kernel marker when available. Some
+	# OpenWrt kernels or iproute2 builds do not expose it, so retain a
+	# conservative iproute2 fallback instead of treating a running device as
+	# absent.
+	if [ -f "${SYS_CLASS_NET}/${device}/tun_flags" ]; then
+		flags="$(cat "${SYS_CLASS_NET}/${device}/tun_flags" 2>/dev/null || true)"
+		case "$flags" in
+			0x*|0X*|*[!0-9]*) : ;;
+			*)
+				case $((flags & 3)) in
+					1) printf '%s\n' tun; return 0 ;;
+					2) printf '%s\n' tap; return 0 ;;
+				esac
+			;;
+		esac
+		if device_mode_matches_tun_flags tun "$flags"; then
+			printf '%s\n' tun
+			return 0
+		fi
+		if device_mode_matches_tun_flags tap "$flags"; then
+			printf '%s\n' tap
+			return 0
+		fi
+	fi
+
+	if command -v ip >/dev/null 2>&1; then
+		details="$(ip -d link show dev "$device" 2>/dev/null || true)"
+		device_mode_matches_link_details tun "$details" && {
+			printf '%s\n' tun
+			return 0
+		}
+		device_mode_matches_link_details tap "$details" && {
+			printf '%s\n' tap
+			return 0
+		}
+	fi
+
+	return 1
+}
+
+device_matches_mode() {
+	local mode="$1"
+	local device="$2"
+	local detected
+
+	detected="$(read_tun_device_type "$device" 2>/dev/null || true)"
+	[ "$detected" = "$mode" ]
+}
+
+device_has_ipv4_address() {
+	local device="$1"
+	local address="$2"
+	local output=""
+
+	[ -n "$device" ] && [ -n "$address" ] || return 1
+	if command -v ip >/dev/null 2>&1; then
+		output="$(ip -4 -o addr show dev "$device" 2>/dev/null || true)"
+		case "$output" in
+			*" inet ${address}/"*) return 0 ;;
+		esac
+	fi
+	if command -v ifconfig >/dev/null 2>&1; then
+		output="$(ifconfig "$device" 2>/dev/null || true)"
+		case "$output" in
+			*"inet addr:${address} "*|*" inet ${address} "*) return 0 ;;
+		esac
+	fi
+	return 1
+}
+
+device_has_any_ipv4_address() {
+	local device="$1"
+	local output=""
+
+	[ -n "$device" ] || return 1
+	if command -v ip >/dev/null 2>&1; then
+		output="$(ip -4 -o addr show dev "$device" 2>/dev/null || true)"
+		[ -n "$output" ] && return 0
+		return 1
+	fi
+	if command -v ifconfig >/dev/null 2>&1; then
+		output="$(ifconfig "$device" 2>/dev/null || true)"
+		case "$output" in
+			*"inet addr:"*|*" inet "*) return 0 ;;
+		esac
+		return 1
+	fi
+	# Keep compatibility with minimal systems where address inspection is not
+	# available; device type checks still prevent placeholder bindings.
+	return 0
+}
+
+detect_configured_tun_device() {
+	local mode="$1"
+	local address="$2"
+	local preferred_device="${3:-}"
+	local dir name detected prefix
+	local match_count=0 first_match="" preferred_match=""
+	local prefix_match="" prefix_match_count=0
+	local address_match="" address_match_count=0
+
+	[ -d "$SYS_CLASS_NET" ] || return 1
+
+	for dir in "$SYS_CLASS_NET"/*; do
+		[ -d "$dir" ] || continue
+		name="${dir##*/}"
+		[ -n "$name" ] || continue
+		detected="$(read_tun_device_type "$name" 2>/dev/null || true)"
+		[ "$detected" = "$mode" ] || continue
+		match_count=$((match_count + 1))
+		[ -n "$first_match" ] || first_match="$name"
+		if [ -z "$preferred_match" ] && [ "$name" = "$preferred_device" ]; then
+			preferred_match="$name"
+		fi
+		if [ -n "$address" ] && device_has_ipv4_address "$name" "$address"; then
+			address_match_count=$((address_match_count + 1))
+			address_match="$name"
+		fi
+		case "$mode" in
+			tap) prefix="tap" ;;
+			tun) prefix="tun" ;;
+			*) prefix="" ;;
+		esac
+		if [ -n "$prefix" ]; then
+			case "$name" in
+				"${prefix}"*)
+					prefix_match_count=$((prefix_match_count + 1))
+					[ -n "$prefix_match" ] || prefix_match="$name"
+				;;
+			esac
+		fi
+	done
+
+	# A configured address identifies the instance; never bind another VPN
+	# while the requested device is still being created or assigned its IP.
+	if [ -n "$address" ]; then
+		[ "$address_match_count" -eq 1 ] || return 1
+		printf '%s\n' "$address_match"
+		return 0
+	fi
+	if [ "$match_count" -eq 1 ]; then
+		printf '%s\n' "$first_match"
+		return 0
+	fi
+	if [ -n "$preferred_match" ]; then
+		printf '%s\n' "$preferred_match"
+		return 0
+	fi
+	if [ "$prefix_match_count" -eq 1 ]; then
+		printf '%s\n' "$prefix_match"
+		return 0
+	fi
+	return 1
+}
+
+sync_network_state() {
+	local cfg="" forward_list="" mode tun_name no_nat
+	local enabled=0
+	local existing_device=""
+	local configured_ip=""
+	local conf_file="" conf_path=""
+
+	NETWORK_SYNC_RESULT=""
+	config_load "$CONF"
+	cfg="$(get_first_section_id "vnt2_cli")"
+	if [ -n "$cfg" ]; then
+		config_get_bool enabled "$cfg" "enabled" "0"
+	fi
+
+	if [ "$enabled" != "1" ]; then
+		cleanup_network || return 1
+		return 0
+	fi
+
+	conf_file="$(trim_value "$(config_get "$cfg" "conf_file")")"
+	if ! is_safe_toml_name "$conf_file" || [ ! -f "${VNT_CONFIG_DIR}/${conf_file}" ] || [ -L "${VNT_CONFIG_DIR}/${conf_file}" ]; then
+		cleanup_network || return 1
+		NETWORK_SYNC_RESULT="no-active-config"
+		return 0
+	fi
+	conf_path="${VNT_CONFIG_DIR}/${conf_file}"
+
+	prepare_client_network_runtime "$cfg" "$conf_path"
+	mode="$VNT2_DEVICE_MODE"
+	tun_name="$VNT2_TUN_NAME"
+	no_nat="$VNT2_NO_NAT"
+	forward_list="$VNT2_FORWARD_LIST"
+
+	case "$mode" in
+		tun|tap) : ;;
+		*)
+			cleanup_network || return 1
+			NETWORK_SYNC_RESULT="no-device-mode"
+			return 0
+		;;
+	esac
+
+	configured_ip="$(trim_value "$(toml_get_value "$conf_path" "ip")")"
+	case "$configured_ip" in
+		*/*) configured_ip="${configured_ip%%/*}" ;;
+	esac
+	case "$configured_ip" in
+		[0-9]*.[0-9]*.[0-9]*.[0-9]*) : ;;
+		*) configured_ip="" ;;
+	esac
+
+	if [ -n "$tun_name" ]; then
+		case "$tun_name" in
+			*/*|*..*) tun_name="" ;;
+		esac
+		if [ -n "$tun_name" ] && device_matches_mode "$mode" "$tun_name"; then
+			: # The named runtime device exists and has the requested layer.
+		else
+			tun_name=""
+		fi
+	else
+		existing_device="$(trim_value "$(uci -q get network.VNT2.device 2>/dev/null || true)")"
+		tun_name="$(detect_configured_tun_device "$mode" "$configured_ip" "$existing_device" 2>/dev/null || true)"
+	fi
+
+	if [ -z "$tun_name" ]; then
+		log_service "network sync waiting for ${mode} device for ${conf_file}"
+		cleanup_network || return 1
+		NETWORK_SYNC_RESULT="missing-runtime-device"
+		return 0
+	fi
+	if ! device_has_any_ipv4_address "$tun_name"; then
+		log_service "network sync waiting for IPv4 address on ${tun_name}"
+		cleanup_network || return 1
+		NETWORK_SYNC_RESULT="missing-runtime-address"
+		return 0
+	fi
+
+	if ! configure_network "$tun_name" "$forward_list" "$no_nat"; then
+		NETWORK_SYNC_RESULT="configure-failed:${tun_name}"
+		return 1
+	fi
+	NETWORK_SYNC_RESULT="configured:${tun_name}"
+	return 0
+}
+
+sync_network_command() {
+	local rc
+
+	sync_network_state
+	rc=$?
+	if [ "$rc" -eq 0 ]; then
+		if [ -n "$NETWORK_SYNC_RESULT" ]; then
+			log_service "network sync result: ${NETWORK_SYNC_RESULT}"
+		fi
+		return 0
+	fi
+	log_service "network sync failed rc=${rc}"
+	return "$rc"
+}
+
+sync_network() {
+	sync_network_command
+}
+
+prepare_client_network_runtime() {
+	local cfg="$1"
+	local conf_file="$2"
+	local bind_dev="" forward_list="" forward_raw="" tun_name device_mode no_nat
+
+	VNT2_FORWARD_LIST=""
+	if [ -n "$cfg" ]; then
+		config_get bind_dev "$cfg" "bind_dev"
+		config_list_foreach "$cfg" vnt2_forward append_forward_item
+		if [ -z "$VNT2_FORWARD_LIST" ]; then
+			config_get forward_raw "$cfg" "vnt2_forward"
+			append_forward_items_from_string "$forward_raw"
+		fi
+		forward_list="${VNT2_FORWARD_LIST}"
+	fi
+
+	tun_name="$(trim_value "$(toml_get_value "${conf_file}" "tun_name")")"
+	device_mode="$(trim_value "$(toml_get_value "${conf_file}" "device_mode")")"
+	[ -n "$device_mode" ] || device_mode="tun"
+	case "$device_mode" in
+		no|tun|tap) : ;;
+		*)
+			log_service "invalid device_mode=${device_mode}, using tun"
+			device_mode="tun"
+		;;
+	esac
+	no_nat="$(toml_get_bool "${conf_file}" "no_nat")"
+	[ -n "$no_nat" ] || no_nat="0"
+
+	VNT2_BIND_DEV="${bind_dev}"
+	VNT2_TUN_NAME="${tun_name}"
+	VNT2_DEVICE_MODE="${device_mode}"
+	VNT2_NO_NAT="${no_nat}"
+	VNT2_FORWARD_LIST="${forward_list}"
+	return 0
+}
+
+append_forward_item() {
+	local value="$1"
+	value="$(trim_value "$value")"
+	[ -n "$value" ] || return 0
+	if [ -n "${VNT2_FORWARD_LIST}" ]; then
+		VNT2_FORWARD_LIST="${VNT2_FORWARD_LIST} ${value}"
+	else
+		VNT2_FORWARD_LIST="${value}"
+	fi
+}
+
+append_forward_items_from_string() {
+	local values="$1"
+	local item
+
+	values="$(trim_value "$values")"
+	[ -n "$values" ] || return 0
+
+	for item in $values; do
+		append_forward_item "$item"
+	done
+}
+
+valid_machine_id() {
+	case "$1" in
+		''|*[!0-9a-fA-F]*) return 1 ;;
+	esac
+	[ "${#1}" -eq 32 ] && [ "$1" != "00000000000000000000000000000000" ]
+}
+
+read_machine_id() {
+	local file="$1" size id
+
+	# Never read pipes/devices, or an unexpectedly large file, during startup.
+	[ -f "$file" ] || return 1
+	size="$(stat -L -c '%s' "$file" 2>/dev/null)" || return 1
+	case "$size" in
+		''|*[!0-9]*) return 1 ;;
+	esac
+	[ "$size" -le 128 ] || return 1
+	id="$(dd if="$file" bs=129 count=1 2>/dev/null)" || return 1
+	id="$(trim_value "$id")"
+	valid_machine_id "$id" || return 1
+	printf '%s\n' "$id"
+}
+
+ensure_persistent_machine_id() {
+	local id tmp dbus_id
+
+	if [ -e "$DBUS_MACHINE_ID_FILE" ] && [ ! -f "$DBUS_MACHINE_ID_FILE" ]; then
+		log_service 'D-Bus machine-id must be a regular file; client startup cancelled'
+		return 1
+	fi
+
+	# The fixed upstream binary resolves its device identity from these files.
+	# OpenWrt puts /var in /tmp, so both paths must use the persistent ID.
+	if [ -e "$MACHINE_ID_FILE" ] || [ -L "$MACHINE_ID_FILE" ]; then
+		[ -f "$MACHINE_ID_FILE" ] && [ ! -L "$MACHINE_ID_FILE" ] || {
+			log_service 'persistent machine-id must be a regular file'
+			return 1
+		}
+		id="$(read_machine_id "$MACHINE_ID_FILE")" || {
+			log_service 'invalid persistent machine-id; refusing to change device identity'
+			return 1
+		}
+	else
+		id="$(read_machine_id "$DBUS_MACHINE_ID_FILE" 2>/dev/null)" || id=""
+		if ! valid_machine_id "$id"; then
+			id="$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d '[:space:]')"
+			valid_machine_id "$id" || {
+				log_service 'failed to generate persistent machine-id'
+				return 1
+			}
+		fi
+		tmp="$(mktemp "${MACHINE_ID_FILE}.XXXXXX")" || {
+			log_service 'failed to create persistent machine-id temporary file'
+			return 1
+		}
+		if ! printf '%s\n' "$id" >"$tmp" ||
+			! chmod 444 "$tmp" || ! mv -f "$tmp" "$MACHINE_ID_FILE"; then
+			rm -f "$tmp"
+			log_service 'failed to persist machine-id; client startup cancelled'
+			return 1
+		fi
+		log_service 'saved machine-id for automatic device identity across reboots'
+	fi
+
+	dbus_id="$(read_machine_id "$DBUS_MACHINE_ID_FILE" 2>/dev/null)" || dbus_id=""
+	if [ "$dbus_id" != "$id" ]; then
+		log_service 'restoring persistent machine-id for automatic device identity'
+	fi
+	if [ -L "$DBUS_MACHINE_ID_FILE" ] &&
+		[ "$(readlink "$DBUS_MACHINE_ID_FILE")" = "$MACHINE_ID_FILE" ]; then
+		return 0
+	fi
+	if ! mkdir -p "$(dirname "$DBUS_MACHINE_ID_FILE")"; then
+		log_service 'failed to create D-Bus machine-id directory'
+		return 1
+	fi
+	# A private temporary directory protects the new link from preexisting paths.
+	tmp="$(mktemp -d "${DBUS_MACHINE_ID_FILE}.XXXXXX")" || {
+		log_service 'failed to create D-Bus machine-id temporary directory'
+		return 1
+	}
+	if ! ln -s "$MACHINE_ID_FILE" "$tmp/id" ||
+		! mv -f "$tmp/id" "$DBUS_MACHINE_ID_FILE"; then
+		rm -f "$tmp/id"
+		rmdir "$tmp"
+		log_service 'failed to link D-Bus machine-id; client startup cancelled'
+		return 1
+	fi
+	rmdir "$tmp"
+	return 0
+}
+
+start_cli_instance() {
+	local cfg="$1"
+	local enabled cli_bin ctrl_bin ctrl_port log_level conf_file conf_path
+
+	config_get_bool enabled "$cfg" "enabled" "0"
+	if [ "$enabled" != "1" ]; then
+		log_service 'not enabled, skip start'
+		cleanup_network
+		return 0
+	fi
+
+	log_service 'start requested'
+
+	config_get conf_file "$cfg" "conf_file" ""
+	conf_file="$(trim_value "$conf_file")"
+	if ! is_safe_toml_name "$conf_file" || [ ! -f "${VNT_CONFIG_DIR}/${conf_file}" ] || [ -L "${VNT_CONFIG_DIR}/${conf_file}" ]; then
+		log_service 'start skipped: no valid config file selected under /vnt_config'
+		cleanup_network
+		return 1
+	fi
+	conf_path="${VNT_CONFIG_DIR}/${conf_file}"
+
+	if ! toml_validate_client_config "$conf_path"; then
+		log_service 'start failed: client TOML validation failed'
+		return 1
+	fi
+
+	cli_bin="$(prepare_binary "$cfg" "vnt2_cli_bin" "/usr/bin/vnt2_cli" "vnt2_cli" "$DOWNLOAD_CLI_STATE" "cli")" || {
+		log_service 'start failed: missing executable vnt2_cli'
+		return 1
+	}
+
+	config_get ctrl_bin "$cfg" "vnt2_ctrl_bin" "/usr/bin/vnt2_ctrl"
+	if ! ensure_elf_exec "$ctrl_bin"; then
+		log_service 'control tool vnt2_ctrl is missing or invalid; status page will show control info as unavailable'
+	fi
+
+	config_get ctrl_port "$cfg" "ctrl_port" "11233"
+	ctrl_port="$(trim_value "$ctrl_port")"
+	valid_port "$ctrl_port" || ctrl_port="11233"
+
+	config_get log_level "$cfg" "log_level" "info"
+	case "$log_level" in
+		error|warn|info|debug|trace) : ;;
+		*) log_level="info" ;;
+	esac
+
+	if ! mkdir -p "${VNT_CONFIG_DIR}" >/dev/null 2>&1; then
+		log_service "failed to create config directory: ${VNT_CONFIG_DIR}"
+		return 1
+	fi
+	if ! chmod 700 "${VNT_CONFIG_DIR}" >/dev/null 2>&1; then
+		log_service "failed to secure config directory: ${VNT_CONFIG_DIR}"
+		return 1
+	fi
+
+	ensure_persistent_machine_id || return 1
+
+	log_service "using ${cli_bin} ctrl=${ctrl_bin} port=${ctrl_port} conf=${conf_path}"
+	procd_open_instance "vnt2_cli"
+	procd_set_param env RUST_LOG="$log_level"
+	procd_set_param command /bin/sh -c "cd /tmp && exec \"${cli_bin}\" --conf \"${conf_path}\" --ctrl-port \"${ctrl_port}\""
+	procd_set_param stdout 0
+	procd_set_param stderr 0
+	procd_set_param respawn 3600 5 5
+	procd_set_param limits core="unlimited"
+	procd_set_param limits nofile="1048576 1048576"
+	procd_set_param term_timeout 10
+	procd_close_instance
+	date +%s >"${CLI_TIME}"
+	log_service 'start command submitted'
+}
+
+
+start_service() {
+	local cfg rc=0
+
+	ensure_log_files
+	log_service 'service start flow begin'
+	log_download 'service start flow begin'
+
+	sync_network_command || rc=1
+
+	config_load "${CONF}"
+	cfg="$(get_first_section_id "vnt2_cli")"
+
+	if [ -n "$cfg" ]; then
+		start_cli_instance "$cfg" || rc=1
+	else
+		log_service 'vnt2_cli config section not found'
+	fi
+
+	log_download "start_service finished rc=${rc}"
+	return "$rc"
+}
+
+stop_service() {
+	ensure_log_files
+	log_service 'service stop flow begin'
+	log_download 'service stop flow begin'
+
+	rm -f "${CLI_TIME}"
+	if [ "${VNT2_RESTART_MODE:-}" = "apply" ]; then
+		# Keep the router management path alive while a queued Save & Apply
+		# restart replaces the managed processes. start_service reconciles any
+		# changed network and firewall settings immediately afterwards.
+		log_download 'queued apply restart keeps network and firewall state'
+	else
+		cleanup_network
+	fi
+
+	log_service 'service stopped'
+	log_download "service stopped"
+}
+
+reload_service() {
+	schedule_restart
+	return 0
+}
+
+schedule_restart() {
+	local marker_tmp="${RESTART_PENDING_FILE}.$$"
+
+	# This path runs inside LuCI/procd reload requests. It must only write a
+	# marker; the separately managed vnt2-worker owns every slow operation.
+	if (umask 077; printf '%s\n' "$(date +%s)" >"${marker_tmp}"); then
+		mv -f "${marker_tmp}" "${RESTART_PENDING_FILE}" >/dev/null 2>&1 || {
+			rm -f "${marker_tmp}"
+			return 1
+		}
+	else
+		rm -f "${marker_tmp}"
+		return 1
+	fi
+	return 0
+}
+
+service_triggers() {
+	procd_add_reload_trigger "${CONF}"
+}
+

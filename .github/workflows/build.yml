@@ -1,0 +1,197 @@
+name: Build Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag（例如 v2.0.54 或 v2.0.54-1）"
+        required: true
+        type: string
+      description:
+        description: "Release 描述（可选）"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: OpenWrt 24.10.0 IPK
+            sdk_url: https://downloads.openwrt.org/releases/24.10.0/targets/x86/64/openwrt-sdk-24.10.0-x86-64_gcc-13.3.0_musl.Linux-x86_64.tar.zst
+            output: ipk
+          - name: OpenWrt 25.12.0 APK
+            sdk_url: https://downloads.openwrt.org/releases/25.12.0/targets/x86/64/openwrt-sdk-25.12.0-x86-64_gcc-14.3.0_musl.Linux-x86_64.tar.zst
+            output: apk
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install check tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y lua5.1 zstd
+
+      - name: Locate package source directory
+        id: pkgdir
+        run: |
+          set -e
+          # Normalize CRLF in Makefile before matching the package name.
+          makefile="$(mktemp)"
+          found=""
+          while IFS= read -r candidate; do
+            tr -d '\r' <"$candidate" >"$makefile"
+            if grep -q '^PKG_NAME:=luci-app-vnt2cli[[:space:]]*$' "$makefile"; then
+              found="$(dirname "$candidate")"
+              break
+            fi
+          done < <(find . -name Makefile -type f)
+          if [ -z "$found" ]; then
+            echo "::error::no Makefile with PKG_NAME:=luci-app-vnt2cli found"
+            exit 1
+          fi
+          echo "dir=$found" >>"$GITHUB_OUTPUT"
+          echo "package source directory: $found"
+
+      - name: Pre-build checks
+        run: |
+          set -e
+          bash tests/validate-source.sh "${{ steps.pkgdir.outputs.dir }}"
+
+      - name: Update package version from tag
+        run: |
+          set -e
+          pkg_dir="${{ steps.pkgdir.outputs.dir }}"
+          tag="${{ inputs.tag }}"
+          version="${tag#v}"
+          version="${version#V}"
+          release_from_tag="${version#*-}"
+          if [ "$release_from_tag" != "$version" ]; then
+            version="${version%-*}"
+          else
+            release_from_tag=""
+          fi
+          if [ -n "$release_from_tag" ]; then
+            sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=$version/" "$pkg_dir/Makefile"
+            sed -i "s/^PKG_RELEASE:=.*/PKG_RELEASE:=$release_from_tag/" "$pkg_dir/Makefile"
+          else
+            sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=$version/" "$pkg_dir/Makefile"
+          fi
+          grep -E '^PKG_(VERSION|RELEASE):=' "$pkg_dir/Makefile"
+
+      - name: Download and extract SDK
+        run: |
+          set -e
+          curl -fsSL "${{ matrix.sdk_url }}" -o sdk.tar.zst
+          mkdir sdk
+          tar --zstd -xf sdk.tar.zst -C sdk --strip-components=1
+
+      - name: Build package
+        working-directory: sdk
+        run: |
+          set -e
+          ./scripts/feeds update -a
+          ./scripts/feeds install luci
+          cp -r "${{ steps.pkgdir.outputs.dir }}" package/luci-app-vnt2cli
+          make defconfig
+          make package/luci-app-vnt2cli/compile V=s -j"$(nproc)"
+
+      - name: Collect artifact
+        id: collect
+        run: |
+          set -e
+          tag="${{ inputs.tag }}"
+          version="${tag#v}"
+          version="${version#V}"
+          version="${version%%-*}"
+          ext="${{ matrix.output }}"
+          out_dir="release_artifacts"
+          mkdir -p "$out_dir"
+          candidates=$(find sdk/bin -type f -name "luci-app-vnt2cli*.${ext}" 2>/dev/null || true)
+          count=$(printf '%s\n' "$candidates" | grep -c . || true)
+          if [ "$count" -ne 1 ]; then
+            echo "::error::expected exactly one .${ext} artifact, found ${count}"
+            printf '%s\n' "$candidates"
+            exit 1
+          fi
+          src="$(printf '%s\n' "$candidates" | head -n1)"
+          dest="${out_dir}/luci-app-vnt2cli_${version}-all.${ext}"
+          cp -f "$src" "$dest"
+          echo "file=$dest" >>"$GITHUB_OUTPUT"
+          ls -la "$out_dir"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: luci-app-vnt2cli-${{ matrix.output }}
+          path: release_artifacts/*
+
+  release:
+    name: Publish Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: ${{ success() }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release_artifacts
+
+      - name: Prepare release body
+        run: |
+          {
+            printf '编译时间：%s\n' "$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            printf '\n%s\n' "${{ inputs.description }}"
+          } >release_body.md
+          # Drop leading/trailing blank lines when the description is empty.
+          sed -i -e '/./,$!d' release_body.md
+          sed -i -e :a -e '/^\n*$/{$d;N;}; /\n$/ba' release_body.md
+
+      - name: Verify release files
+        run: |
+          set -e
+          tag="${{ inputs.tag }}"
+          version="${tag#v}"
+          version="${version#V}"
+          version="${version%%-*}"
+          expected_ipk="release_artifacts/luci-app-vnt2cli-ipk/luci-app-vnt2cli_${version}-all.ipk"
+          expected_apk="release_artifacts/luci-app-vnt2cli-apk/luci-app-vnt2cli_${version}-all.apk"
+          if [ ! -f "$expected_ipk" ] || [ ! -f "$expected_apk" ]; then
+            echo "::error::release artifacts missing"
+            find release_artifacts -type f
+            exit 1
+          fi
+          if find release_artifacts -type f ! -name "luci-app-vnt2cli_${version}-all.ipk" ! -name "luci-app-vnt2cli_${version}-all.apk" | grep -q .; then
+            echo "::error::unexpected extra files in release artifacts"
+            find release_artifacts -type f
+            exit 1
+          fi
+
+      - name: Check tag does not exist
+        run: |
+          set -e
+          tag="${{ inputs.tag }}"
+          if git ls-remote --tags origin "refs/tags/${tag}" | grep -q .; then
+            echo "::error::tag ${tag} already exists, refusing to overwrite"
+            exit 1
+          fi
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          name: ${{ inputs.tag }}
+          body_path: release_body.md
+          files: |
+            release_artifacts/luci-app-vnt2cli-ipk/*
+            release_artifacts/luci-app-vnt2cli-apk/*

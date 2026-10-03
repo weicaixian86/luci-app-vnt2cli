@@ -1,0 +1,13 @@
+config vnt2_cli
+	option enabled '0'
+	option auto_download '1'
+	option download_mirror 'auto'
+	option custom_download_mirror ''
+	option vnt2_cli_bin '/usr/bin/vnt2_cli'
+	option vnt2_ctrl_bin '/usr/bin/vnt2_ctrl'
+	option ctrl_port '11233'
+	option conf_file ''
+	option log_level 'info'
+	list vnt2_forward 'vnt2fwlan'
+	list vnt2_forward 'vnt2fwwan'
+	list vnt2_forward 'lanfwvnt2'

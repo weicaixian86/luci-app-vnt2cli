@@ -1,0 +1,282 @@
+<%
+local dsp = require "luci.dispatcher"
+local config_list_url = dsp.build_url("admin", "vpn", "vnt2", "config_list")
+local config_read_url = dsp.build_url("admin", "vpn", "vnt2", "config_read")
+local config_save_url = dsp.build_url("admin", "vpn", "vnt2", "config_save")
+local config_delete_url = dsp.build_url("admin", "vpn", "vnt2", "config_delete")
+local config_use_url = dsp.build_url("admin", "vpn", "vnt2", "config_use")
+%>
+
+<style type="text/css">
+	.vnt2-cfg-wrap {
+		margin: 4px 0 12px;
+	}
+	.vnt2-cfg-card {
+		border: 1px solid var(--border-color-medium, var(--border-color-high, #d9d9d9));
+		border-radius: 4px;
+		padding: 10px 12px;
+		background: var(--card-background, var(--panel-bg, var(--background-color, #fff)));
+		color: var(--text-color, inherit);
+		font-size: 14px;
+		line-height: 1.6;
+		margin-bottom: 12px;
+	}
+	.vnt2-cfg-card h3 {
+		margin: 0 0 8px;
+		font-size: 17px;
+		font-weight: 600;
+	}
+	.vnt2-cfg-table {
+		width: 100%;
+		border-collapse: collapse;
+		font: inherit;
+	}
+	.vnt2-cfg-table th,
+	.vnt2-cfg-table td {
+		padding: 4px 8px;
+		border-bottom: 1px dashed var(--border-color-low, #ececec);
+		text-align: left;
+		word-break: break-all;
+	}
+	.vnt2-cfg-table th {
+		color: var(--text-color-low, #666);
+		font-weight: 500;
+	}
+	.vnt2-cfg-active {
+		color: #19a15f;
+		font-weight: 600;
+	}
+	.vnt2-cfg-name {
+		width: 260px;
+	}
+	#vnt2_cfg_editor {
+		width: 100%;
+		box-sizing: border-box;
+		min-height: 320px;
+		font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+		font-size: 12px;
+		line-height: 1.45;
+		white-space: pre;
+		resize: vertical;
+	}
+	.vnt2-cfg-msg {
+		font-size: 13px;
+		margin: 6px 0 0;
+		min-height: 18px;
+	}
+	.vnt2-cfg-msg.ok {
+		color: #19a15f;
+	}
+	.vnt2-cfg-msg.err {
+		color: #d9534f;
+	}
+	.vnt2-cfg-actions {
+		display: flex;
+		gap: 8px;
+		margin-top: 8px;
+		flex-wrap: wrap;
+		align-items: center;
+	}
+</style>
+
+<div class="vnt2-cfg-wrap">
+	<div class="vnt2-cfg-card">
+		<h3>配置文件列表（/vnt_config/*.toml）</h3>
+		<table class="vnt2-cfg-table">
+			<thead>
+				<tr><th>状态</th><th>文件名</th><th>操作</th></tr>
+			</thead>
+			<tbody id="vnt2_cfg_rows">
+				<tr><td colspan="3">加载中…</td></tr>
+			</tbody>
+		</table>
+		<div class="vnt2-cfg-msg" id="vnt2_cfg_list_msg"></div>
+	</div>
+
+	<div class="vnt2-cfg-card">
+		<h3 id="vnt2_cfg_editor_title">编辑配置</h3>
+		<div style="margin: 4px 0;">
+			<label>文件名：<input type="text" class="cbi-input-text" id="vnt2_cfg_name" style="width:260px" placeholder="example.toml" /></label>
+			<span style="font-size:12px; color:#888;">只能包含字母、数字、点、下划线、短横线，且以 .toml 结尾</span>
+		</div>
+		<textarea id="vnt2_cfg_editor" class="cbi-input-textarea" spellcheck="false" wrap="off"></textarea>
+		<div class="vnt2-cfg-actions">
+			<input class="cbi-button cbi-button-apply" type="button" onclick="vnt2CfgSave()" value="保存配置" />
+			<input class="cbi-button" type="button" onclick="vnt2CfgNew()" value="新建配置" />
+			<span id="vnt2_cfg_overwrite_note" style="font-size:12px; color:#888;"></span>
+		</div>
+		<div class="vnt2-cfg-msg" id="vnt2_cfg_editor_msg"></div>
+	</div>
+</div>
+
+<script type="text/javascript">
+//<![CDATA[
+(function() {
+	var listUrl = "<%=config_list_url%>";
+	var readUrl = "<%=config_read_url%>";
+	var saveUrl = "<%=config_save_url%>";
+	var deleteUrl = "<%=config_delete_url%>";
+	var useUrl = "<%=config_use_url%>";
+
+	function byId(id) {
+		return document.getElementById(id);
+	}
+
+	function escapeHtml(v) {
+		return String(v === null || v === undefined ? "" : v)
+			.replace(/&/g, "&amp;")
+			.replace(/</g, "&lt;")
+			.replace(/>/g, "&gt;")
+			.replace(/"/g, "&quot;")
+			.replace(/'/g, "&#39;");
+	}
+
+	function setMessage(id, text, ok) {
+		var node = byId(id);
+		if (!node) return;
+		node.textContent = text || "";
+		node.className = "vnt2-cfg-msg " + (ok ? "ok" : "err");
+	}
+
+	function getJSON(url, params, cb) {
+		XHR.get(url, params || null, function(x, data) {
+			cb(x, data);
+		});
+	}
+
+	function postJSON(url, params, cb) {
+		XHR.post(url, params, function(x, data) {
+			cb(x, data);
+		});
+	}
+
+	function validName(name) {
+		return /^[A-Za-z0-9][A-Za-z0-9._-]*\.toml$/.test(name) && name.indexOf("..") < 0;
+	}
+
+	function renderList(data) {
+		var rows = byId("vnt2_cfg_rows");
+		if (!rows) return;
+		rows.innerHTML = "";
+		if (!data || !data.ok) {
+			rows.innerHTML = '<tr><td colspan="3">加载失败</td></tr>';
+			return;
+		}
+		if (!data.configs || !data.configs.length) {
+			rows.innerHTML = '<tr><td colspan="3">暂无配置：请在下方新建第一个 TOML 配置（需包含 network_code 或 subscription 字段）</td></tr>';
+			return;
+		}
+		for (var i = 0; i < data.configs.length; i++) {
+			var name = data.configs[i];
+			var active = (data.active === name);
+			var tr = document.createElement("tr");
+			tr.innerHTML =
+				"<td>" + (active ? '<span class="vnt2-cfg-active">启用中</span>' : "未启用") + "</td>" +
+				"<td>" + escapeHtml(name) + "</td>" +
+				"<td>" +
+					'<input class="cbi-button" type="button" value="编辑" onclick="vnt2CfgEdit(\'' + escapeHtml(name) + '\')" />' +
+					" " +
+					(active ? "" : '<input class="cbi-button cbi-button-apply" type="button" value="设为启用" onclick="vnt2CfgUse(\'' + escapeHtml(name) + '\')" />') +
+					" " +
+					'<input class="cbi-button cbi-button-remove" type="button" value="删除" onclick="vnt2CfgRemove(\'' + escapeHtml(name) + '\', ' + (active ? "true" : "false") + ')" />' +
+				"</td>";
+			rows.appendChild(tr);
+		}
+	}
+
+	function reloadList() {
+		getJSON(listUrl, null, function(x, data) {
+			renderList(data);
+		});
+	}
+
+	window.vnt2CfgEdit = function(name) {
+		getJSON(readUrl, { name: name }, function(x, data) {
+			if (data && data.ok) {
+				byId("vnt2_cfg_name").value = data.name;
+				byId("vnt2_cfg_editor").value = data.content;
+				byId("vnt2_cfg_editor_title").textContent = "编辑配置：" + data.name;
+				byId("vnt2_cfg_overwrite_note").textContent = "保存将覆盖现有文件";
+				setMessage("vnt2_cfg_editor_msg", "", true);
+			} else {
+				setMessage("vnt2_cfg_editor_msg", (data && data.error) || "读取失败", false);
+			}
+		});
+	};
+
+	window.vnt2CfgNew = function() {
+		byId("vnt2_cfg_name").value = "";
+		byId("vnt2_cfg_editor").value = '# VNT 客户端配置示例\n' +
+			'# 网络编号，相同网络编号的设备会组在同一个虚拟网（必填）\n' +
+			'network_code = "your_network_code"\n\n' +
+			'# 服务器地址列表（支持 quic / tcp / wss / dynamic）（必填）\n' +
+			'server = ["quic://1.2.3.4:29872"]\n\n' +
+			'# 固定虚拟 IP/CIDR（可选）\n' +
+			'# ip = "10.26.0.2/24"\n\n' +
+			'# 虚拟网卡模式：no（无网卡）、tun（三层网卡，默认）、tap（二层网卡）\n' +
+			'# device_mode = "tun"\n';
+		byId("vnt2_cfg_editor_title").textContent = "新建配置";
+		byId("vnt2_cfg_overwrite_note").textContent = "";
+		setMessage("vnt2_cfg_editor_msg", "", true);
+		byId("vnt2_cfg_name").focus();
+	};
+
+	window.vnt2CfgSave = function() {
+		var name = byId("vnt2_cfg_name").value.replace(/^\s+|\s+$/g, "");
+		var content = byId("vnt2_cfg_editor").value;
+		if (!validName(name)) {
+			setMessage("vnt2_cfg_editor_msg", "文件名不安全：只能包含字母、数字、点、下划线、短横线，且以 .toml 结尾", false);
+			return;
+		}
+		if (!/\S/.test(content)) {
+			setMessage("vnt2_cfg_editor_msg", "配置内容不能为空", false);
+			return;
+		}
+		postJSON(saveUrl, { name: name, content: content }, function(x, data) {
+			if (data && data.ok) {
+				var msg = "已保存 " + data.name;
+				if (data.hint) {
+					msg += "。" + data.hint;
+				}
+				setMessage("vnt2_cfg_editor_msg", msg, true);
+				byId("vnt2_cfg_overwrite_note").textContent = "";
+				reloadList();
+			} else {
+				setMessage("vnt2_cfg_editor_msg", (data && data.error) || "保存失败", false);
+			}
+		});
+	};
+
+	window.vnt2CfgRemove = function(name, isActive) {
+		var tip = "确定删除配置 " + name + " ？";
+		if (isActive) {
+			tip += "\n该配置当前处于启用状态，删除后将同时取消启用并重启服务。";
+		}
+		if (!window.confirm(tip)) {
+			return;
+		}
+		postJSON(deleteUrl, { name: name }, function(x, data) {
+			if (data && data.ok) {
+				setMessage("vnt2_cfg_list_msg", "已删除 " + name, true);
+				reloadList();
+			} else {
+				setMessage("vnt2_cfg_list_msg", (data && data.error) || "删除失败", false);
+			}
+		});
+	};
+
+	window.vnt2CfgUse = function(name) {
+		postJSON(useUrl, { name: name }, function(x, data) {
+			if (data && data.ok) {
+				setMessage("vnt2_cfg_list_msg", "已启用 " + name + "，后台将重启 vnt2_cli 生效", true);
+				reloadList();
+			} else {
+				setMessage("vnt2_cfg_list_msg", (data && data.error) || "切换失败", false);
+			}
+		});
+	};
+
+	reloadList();
+})();
+//]]>
+</script>

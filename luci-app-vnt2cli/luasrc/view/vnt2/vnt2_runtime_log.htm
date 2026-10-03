@@ -1,0 +1,74 @@
+<%
+local textutil = require "luci.model.vnt2_text"
+local function read_runtime_log()
+	return textutil.merge_log_files({
+		"/tmp/logs/vnt2.log",
+		"/tmp/vnt2-download.log"
+	}, 300)
+end
+local log_content = read_runtime_log()
+-%>
+
+<style type="text/css">
+	.vnt2-log-toolbar {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		margin: 0 0 8px;
+		font-size: 12px;
+	}
+	.vnt2-log-toolbar input[type="checkbox"] {
+		vertical-align: middle;
+	}
+	#runtime_log_textarea {
+		width: 100%;
+		min-height: 420px;
+		margin: 0;
+		box-sizing: border-box;
+		font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+		font-size: 12px;
+		line-height: 1.45;
+		resize: vertical;
+	}
+</style>
+
+<script type="text/javascript">
+//<![CDATA[
+(function() {
+	var logUrl = '<%=url([[admin]], [[vpn]], [[vnt2]], [[get_runtime_log]])%>';
+	var clearUrl = '<%=url([[admin]], [[vpn]], [[vnt2]], [[clear_runtime_log]])%>';
+
+	function logArea() {
+		return document.getElementById('runtime_log_textarea');
+	}
+
+	function updateLog(x) {
+		var area = logArea();
+		var autoRefresh = document.getElementById('runtime_log_auto_refresh');
+		if (x && x.status === 200 && area && autoRefresh && autoRefresh.checked) {
+			area.value = x.responseText || '';
+			area.scrollTop = area.scrollHeight;
+		}
+	}
+
+	window.clearRuntimeLog = function() {
+		XHR.get(clearUrl, null, function(x) {
+			if (x && x.status === 200) {
+				var area = logArea();
+				if (area) area.value = '';
+			}
+		});
+	};
+
+	XHR.poll(5, logUrl, null, updateLog);
+})();
+//]]>
+</script>
+
+<fieldset class="cbi-section" id="_runtime_log_fieldset">
+	<div class="vnt2-log-toolbar">
+		<label><input type="checkbox" id="runtime_log_auto_refresh" checked="checked" /> <%:自动刷新%></label>
+		<input class="cbi-button cbi-input-remove" type="button" onclick="clearRuntimeLog()" value="<%:清除日志%>" />
+	</div>
+	<textarea id="runtime_log_textarea" class="cbi-input-textarea" data-update="change" rows="24" wrap="off" readonly="readonly"><%=log_content%></textarea>
+</fieldset>

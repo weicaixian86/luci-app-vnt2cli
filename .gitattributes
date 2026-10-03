@@ -1,0 +1,12 @@
+# Normalize repository text to LF in the Linux build environment.
+* text=auto eol=lf
+
+*.sh text eol=lf
+*.lua text eol=lf
+*.htm text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.md text eol=lf
+Makefile text eol=lf
+vnt2 text eol=lf
+vnt2cli text eol=lf

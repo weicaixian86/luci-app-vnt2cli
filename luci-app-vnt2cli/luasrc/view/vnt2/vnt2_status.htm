@@ -1,0 +1,306 @@
+<%
+local dsp = require "luci.dispatcher"
+local status_url = dsp.build_url("admin", "vpn", "vnt2", "status")
+local ctrl_query_url = dsp.build_url("admin", "vpn", "vnt2", "ctrl_query")
+%>
+
+<style type="text/css">
+	.vnt2-status-wrap {
+		margin: 4px 0 12px;
+	}
+	.vnt2-status-grid {
+		display: block;
+	}
+	.vnt2-card {
+		border: 1px solid var(--border-color-medium, var(--border-color-high, #d9d9d9));
+		border-radius: 4px;
+		padding: 8px 10px;
+		background: var(--card-background, var(--panel-bg, var(--background-color, #fff)));
+		color: var(--text-color, inherit);
+		box-shadow: none;
+		font-size: 14px;
+		line-height: 1.5;
+		margin-bottom: 12px;
+	}
+	.vnt2-card h3 {
+		margin: 0 0 4px;
+		font-size: 18px;
+		font-weight: 600;
+		line-height: 1.4;
+		color: var(--text-color-high, var(--text-color, inherit));
+	}
+	.vnt2-badge {
+		display: inline-block;
+		min-width: 60px;
+		padding: 0 7px;
+		border-radius: 3px;
+		font-size: 14px;
+		font-weight: 400;
+		line-height: 1.5;
+		color: #fff;
+		text-align: center;
+		margin-left: 8px;
+		vertical-align: middle;
+	}
+	.vnt2-on {
+		background: #19a15f;
+	}
+	.vnt2-off {
+		background: #d9534f;
+	}
+	.vnt2-card table {
+		width: 100%;
+		border-collapse: collapse;
+		font: inherit;
+		background: transparent;
+		color: inherit;
+	}
+	.vnt2-card table tr,
+	.vnt2-card table tbody,
+	.vnt2-card table thead {
+		background: transparent !important;
+		color: inherit;
+	}
+	.vnt2-card td,
+	.vnt2-card th {
+		padding: 2px 0;
+		border-bottom: 1px dashed var(--border-color-low, var(--border-color-medium, #ececec));
+		vertical-align: top;
+		word-break: break-all;
+		background: transparent !important;
+		box-shadow: none !important;
+	}
+	.vnt2-card td:first-child {
+		width: 104px;
+		color: var(--text-color-low, var(--text-color, #666));
+		padding-right: 8px;
+	}
+	.vnt2-card td:last-child {
+		color: var(--text-color-high, var(--text-color, #222));
+	}
+	.vnt2-pre {
+		width: 100%;
+		box-sizing: border-box;
+		min-height: 80px;
+		max-height: 320px;
+		overflow: auto;
+		font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+		font-size: 12px;
+		line-height: 1.45;
+		white-space: pre;
+		background: var(--background-color-low, #f7f7f7);
+		border: 1px solid var(--border-color-low, #ececec);
+		border-radius: 3px;
+		padding: 6px 8px;
+		margin: 4px 0 0;
+	}
+	.vnt2-log-toolbar {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		margin: 6px 0 2px;
+		font-size: 12px;
+	}
+</style>
+
+<div class="vnt2-status-wrap">
+	<div class="vnt2-status-grid">
+		<div class="vnt2-card">
+			<h3>
+				vnt2_cli 客户端状态
+				<span id="cli_status_badge" class="vnt2-badge vnt2-off">未运行</span>
+			</h3>
+			<table>
+				<tr><td>本地版本</td><td id="cli_tag">-</td></tr>
+				<tr><td>目标版本</td><td id="cli_target_tag">-</td></tr>
+				<tr><td>启用配置</td><td id="cli_conf">-</td></tr>
+				<tr><td>运行时长</td><td id="cli_runtime">-</td></tr>
+				<tr><td>进程/PID</td><td id="cli_pid">-</td></tr>
+				<tr><td>CPU / 内存</td><td id="cli_usage">-</td></tr>
+				<tr><td>日志级别</td><td id="cli_log_level">-</td></tr>
+				<tr><td>下载状态</td><td id="cli_download">-</td></tr>
+			</table>
+		</div>
+
+		<div class="vnt2-card">
+			<h3>运行信息 <span id="ctrl_state_note" style="font-size:13px; font-weight:400; color:#888;"></span></h3>
+			<table>
+				<tr><td>服务器</td><td id="ctrl_server">-</td></tr>
+				<tr><td>设备名称</td><td id="ctrl_name">-</td></tr>
+				<tr><td>设备 ID</td><td id="ctrl_device_id">-</td></tr>
+				<tr><td>客户端版本</td><td id="ctrl_version">-</td></tr>
+				<tr><td>虚拟 IP</td><td id="ctrl_ip">-</td></tr>
+				<tr><td>节点数</td><td id="ctrl_clients_summary">-</td></tr>
+				<tr><td>NAT 类型</td><td id="ctrl_nat_type">-</td></tr>
+				<tr><td>公网 IPv4</td><td id="ctrl_public_ipv4">-</td></tr>
+				<tr><td>IPv6</td><td id="ctrl_public_ipv6">-</td></tr>
+				<tr><td>最近连接</td><td id="ctrl_last_connected">-</td></tr>
+			</table>
+		</div>
+
+		<div class="vnt2-card">
+			<h3>节点列表</h3>
+			<div class="vnt2-log-toolbar">
+				<label><input type="checkbox" id="ctrl_clients_refresh" checked="checked" /> <%:自动刷新%></label>
+				<input class="cbi-button" type="button" onclick="fetchCtrlText('clients')" value="<%:立即刷新%>" />
+			</div>
+			<pre class="vnt2-pre" id="ctrl_clients_text">-</pre>
+		</div>
+
+		<div class="vnt2-card">
+			<h3>路由列表</h3>
+			<div class="vnt2-log-toolbar">
+				<label><input type="checkbox" id="ctrl_route_refresh" checked="checked" /> <%:自动刷新%></label>
+				<input class="cbi-button" type="button" onclick="fetchCtrlText('route')" value="<%:立即刷新%>" />
+			</div>
+			<pre class="vnt2-pre" id="ctrl_route_text">-</pre>
+		</div>
+	</div>
+
+</div>
+
+<script type="text/javascript">
+//<![CDATA[
+(function() {
+	var statusUrl = "<%=status_url%>";
+	var ctrlQueryUrl = "<%=ctrl_query_url%>";
+
+	function byId(id) {
+		return document.getElementById(id);
+	}
+
+	function escapeHtml(v) {
+		return String(v)
+			.replace(/&/g, "&amp;")
+			.replace(/</g, "&lt;")
+			.replace(/>/g, "&gt;")
+			.replace(/"/g, "&quot;")
+			.replace(/'/g, "&#39;");
+	}
+
+	function text(v, empty) {
+		if (v === null || v === undefined || v === "") {
+			return escapeHtml(empty || "-");
+		}
+		return escapeHtml(v);
+	}
+
+	function setBadge(id, running) {
+		var node = byId(id);
+		if (!node) return;
+		node.className = "vnt2-badge " + (running ? "vnt2-on" : "vnt2-off");
+		node.innerHTML = running ? "运行中" : "未运行";
+	}
+
+	function setHtml(id, value) {
+		var node = byId(id);
+		if (node) {
+			node.innerHTML = value;
+		}
+	}
+
+	function setText(id, value) {
+		var node = byId(id);
+		if (node) {
+			node.textContent = value;
+		}
+	}
+
+	function stateText(obj) {
+		if (!obj) return "-";
+		var items = [];
+		if (obj.state) items.push("状态：" + text(obj.state));
+		if (obj.tag) items.push("版本：" + text(obj.tag));
+		if (obj.arch) items.push("架构：" + text(obj.arch));
+		if (obj.asset) items.push("资源：" + text(obj.asset));
+		if (obj.message) items.push(text(obj.message));
+		if (obj.time) items.push("时间：" + text(obj.time));
+		return items.length ? items.join("<br />") : "-";
+	}
+
+	function checked(id) {
+		var node = byId(id);
+		return node && node.checked;
+	}
+
+	function render(data) {
+		setBadge("cli_status_badge", data.cli_running);
+
+		setHtml("cli_tag", text(data.cli_tag));
+		setHtml("cli_target_tag", text(data.cli_target_tag));
+		setHtml("cli_conf", data.conf_file ? text(data.conf_file) : "<span style='color:#f0ad4e;'>未选择配置文件</span>");
+		setHtml("cli_runtime", text(data.cli_runtime));
+		setHtml("cli_pid", data.cli_running ? ("PID " + text(data.cli_pid)) : "未运行");
+		setHtml("cli_usage", [text(data.cli_cpu, "0"), text(data.cli_ram, "0 MB")].join(" / "));
+		setHtml("cli_log_level", text(data.log_level));
+		setHtml("cli_download", stateText(data.cli_download));
+
+		var info = data.ctrl_info;
+		var note = byId("ctrl_state_note");
+		if (note) {
+			note.textContent = data.ctrl_available ? "" : "（vnt2_ctrl 不可用）";
+		}
+		if (info) {
+			var server = info.server || "-";
+			if (info.server_status) {
+				server += " (" + info.server_status + ")";
+			}
+			setHtml("ctrl_server", text(server));
+			setHtml("ctrl_name", text(info.name));
+			setHtml("ctrl_device_id", text(info.device_id));
+			setHtml("ctrl_version", text(info.version));
+			setHtml("ctrl_ip", text(info.ip));
+			setHtml("ctrl_clients_summary",
+				text(info.online_clients, "0") + " 在线 / " + text(info.total_clients, "0") + " 总数 / " +
+				text(info.p2p_clients, "0") + " P2P");
+			setHtml("ctrl_nat_type", text(info.nat_type));
+			setHtml("ctrl_public_ipv4", text(info.public_ipv4));
+			setHtml("ctrl_public_ipv6", text(info.public_ipv6));
+			setHtml("ctrl_last_connected", text(info.last_connected));
+		} else {
+			setHtml("ctrl_server", "-");
+			setHtml("ctrl_name", "-");
+			setHtml("ctrl_device_id", "-");
+			setHtml("ctrl_version", "-");
+			setHtml("ctrl_ip", "-");
+			setHtml("ctrl_clients_summary", "-");
+			setHtml("ctrl_nat_type", "-");
+			setHtml("ctrl_public_ipv4", "-");
+			setHtml("ctrl_public_ipv6", "-");
+			setHtml("ctrl_last_connected", data.ctrl_error ? "<span style='color:#888;'>" + escapeHtml(data.ctrl_error) + "</span>" : "-");
+		}
+	}
+
+	function fetchCtrlText(what) {
+		XHR.get(ctrlQueryUrl, { what: what }, function(x, data) {
+			var node = byId("ctrl_" + what + "_text");
+			if (!node) return;
+			if (data && data.ok) {
+				node.textContent = data.text || "";
+			} else {
+				node.textContent = (data && data.error) ? data.error : "查询失败";
+			}
+		});
+	}
+	window.fetchCtrlText = fetchCtrlText;
+
+	function updateStatus() {
+		XHR.get(statusUrl, null, function(x, data) {
+			if (!data) {
+				return;
+			}
+			render(data);
+		});
+		if (checked("ctrl_clients_refresh")) {
+			fetchCtrlText("clients");
+		}
+		if (checked("ctrl_route_refresh")) {
+			fetchCtrlText("route");
+		}
+	}
+
+	updateStatus();
+	window.setInterval(updateStatus, 5000);
+})();
+//]]>
+</script>

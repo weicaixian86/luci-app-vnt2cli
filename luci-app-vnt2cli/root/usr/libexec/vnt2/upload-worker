@@ -1,0 +1,445 @@
+#!/bin/sh
+
+PENDING_FILE="${VNT2_UPLOAD_PENDING_FILE:-/etc/vnt2/upload.pending}"
+CLAIMED_FILE="${VNT2_UPLOAD_CLAIMED_FILE:-/etc/vnt2/upload.claimed}"
+UPLOAD_DIR="${VNT2_UPLOAD_DIR:-/etc/vnt2/upload}"
+DOWNLOAD_LOG="${VNT2_UPLOAD_LOG_FILE:-/tmp/vnt2-download.log}"
+DOWNLOAD_STATE="${VNT2_UPLOAD_STATE_FILE:-/tmp/vnt2-download-cli.state}"
+VERSION_STATE_FILE="${VNT2_VERSION_STATE_FILE:-/etc/config/vnt2-cli.version}"
+RESTART_PENDING_FILE="${VNT2_RESTART_PENDING_FILE:-/tmp/vnt2-restart.pending}"
+INSTALL_BIN_DIR="${VNT2_INSTALL_BIN_DIR:-/usr/bin}"
+TARGET_BIN="${INSTALL_BIN_DIR}/vnt2_cli"
+TARGET_CTRL_BIN="${INSTALL_BIN_DIR}/vnt2_ctrl"
+POLL_INTERVAL="${VNT2_UPLOAD_POLL_INTERVAL:-1}"
+UCI_COMMAND="${VNT2_UCI_COMMAND:-uci}"
+
+normalize_text() {
+	printf '%s' "$1" | tr -d '\r\n\000'
+}
+
+log_worker() {
+	printf '%s download : %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$(normalize_text "$*")" >>"${DOWNLOAD_LOG}"
+}
+
+write_state() {
+	local state="$1"
+	local message="$2"
+	local asset="$3"
+	local tag="$4"
+	local arch="$5"
+	local path="$6"
+	local dir temp
+
+	dir="${DOWNLOAD_STATE%/*}"
+	mkdir -p "$dir" >/dev/null 2>&1 || return 1
+	temp="${DOWNLOAD_STATE}.$$"
+	(
+		umask 077
+		cat >"$temp" <<EOF
+state=$(normalize_text "$state")
+message=$(normalize_text "$message")
+asset=$(normalize_text "$asset")
+tag=$(normalize_text "$tag")
+arch=$(normalize_text "$arch")
+path=$(normalize_text "$path")
+time=$(date '+%Y-%m-%d %H:%M:%S')
+EOF
+	) || {
+		rm -f "$temp"
+		return 1
+	}
+	chmod 600 "$temp" >/dev/null 2>&1 || {
+		rm -f "$temp"
+		return 1
+	}
+	mv -f "$temp" "$DOWNLOAD_STATE" >/dev/null 2>&1 || {
+		rm -f "$temp"
+		return 1
+	}
+}
+
+clear_version_state() {
+	rm -f "$VERSION_STATE_FILE" "$VERSION_STATE_FILE".* >/dev/null 2>&1
+}
+
+is_elf_binary() {
+	local bin="$1"
+	local magic expected
+
+	[ -s "$bin" ] || return 1
+	[ ! -L "$bin" ] || return 1
+	# BusyBox od lacks the GNU -A/-t/-N options, so read the four ELF magic
+	# bytes with dd instead of depending on a GNU coreutils od.
+	magic="$(dd if="$bin" bs=1 count=4 2>/dev/null)"
+	expected="$(printf '\177ELF')"
+	[ "$magic" = "$expected" ]
+}
+
+detect_arch_name() {
+	local mach package_arch arm_family arm_abi
+	arm_family=""
+	arm_abi=""
+	mach="$(uname -m 2>/dev/null)"
+	package_arch="$(opkg print-architecture 2>/dev/null | awk '$2 != "all" && $2 != "noarch" {print $2; exit}')"
+	case "$mach" in
+		x86_64|amd64) echo "x86_64"; return 0 ;;
+		aarch64|arm64) echo "aarch64"; return 0 ;;
+		armv7*) arm_family="armv7" ;;
+		arm*) arm_family="arm" ;;
+		mipsel*) echo "mipsel"; return 0 ;;
+		mips*) echo "mips"; return 0 ;;
+		*) ;;
+	esac
+	if [ -n "$arm_family" ]; then
+		if [ -e /lib/ld-musl-armhf.so.1 ] || [ -e /lib/ld-musl-armhf.so.1.* ]; then
+			arm_abi="musleabihf"
+		elif [ -e /lib/ld-musl-arm.so.1 ] || [ -e /lib/ld-musl-arm.so.1.* ]; then
+			arm_abi="musleabi"
+		else
+			case "$package_arch" in
+				*eabihf*|*hard*|*hf*|*neon*|*vfp*) arm_abi="musleabihf" ;;
+				*eabi*|*soft*) arm_abi="musleabi" ;;
+				*) arm_abi="" ;;
+			esac
+		fi
+		[ -n "$arm_abi" ] && { echo "${arm_family}-${arm_abi}"; return 0; }
+	fi
+	case "$package_arch" in
+		*x86_64*|*amd64*) echo "x86_64" ;;
+		*aarch64*|*arm64*) echo "aarch64" ;;
+		*mipsel*) echo "mipsel" ;;
+		*mips*) echo "mips" ;;
+		*) echo "unsupported" ;;
+	esac
+}
+
+archive_paths_are_safe() {
+	awk '
+BEGIN { bad = 0 }
+{
+	entry = $0
+	gsub(/\\/, "/", entry)
+	sub(/^\.\//, "", entry)
+	if (entry ~ /^\// || entry ~ /^[A-Za-z]:\// || entry == ".." ||
+		entry ~ /^\.\.\// || entry ~ /\/\.\.\// || entry ~ /\/\.\.$/) {
+		bad = 1
+	}
+}
+END { exit bad }
+'
+}
+
+zip_archive_is_safe() {
+	local archive="$1"
+	local entries details
+
+	if command -v unzip >/dev/null 2>&1; then
+		entries="$(unzip -Z1 "$archive" 2>/dev/null)" || return 1
+		printf '%s\n' "$entries" | archive_paths_are_safe || return 1
+		details="$(unzip -Z -l "$archive" 2>/dev/null)" || return 1
+		printf '%s\n' "$details" | awk '
+			$1 ~ /^l/ { bad = 1 }
+			END { exit bad }
+		' || return 1
+		return 0
+	fi
+	if command -v bsdtar >/dev/null 2>&1; then
+		entries="$(bsdtar -tf "$archive" 2>/dev/null)" || return 1
+		printf '%s\n' "$entries" | archive_paths_are_safe || return 1
+		details="$(bsdtar -tvf "$archive" 2>/dev/null)" || return 1
+		printf '%s\n' "$details" | awk '
+			{ type = substr($0, 1, 1); if (type != "-" && type != "d") bad = 1 }
+			END { exit bad }
+		' || return 1
+		return 0
+	fi
+	# BusyBox unzip cannot list entries without extracting them safely.
+	return 1
+}
+
+tar_archive_is_safe() {
+	local archive="$1"
+	local entries details
+
+	entries="$(tar -tzf "$archive" 2>/dev/null)" || return 1
+	printf '%s\n' "$entries" | archive_paths_are_safe || return 1
+	details="$(tar -tvzf "$archive" 2>/dev/null)" || return 1
+	printf '%s\n' "$details" | awk '
+		{ type = substr($0, 1, 1); if (type != "-" && type != "d") bad = 1 }
+		END { exit bad }
+	' || return 1
+	return 0
+}
+
+locate_extracted_bin() {
+	local root="$1"
+	local name="$2"
+	local alt_dash alt_under found
+
+	alt_dash="$(printf '%s' "$name" | tr '_' '-')"
+	alt_under="$(printf '%s' "$name" | tr '-' '_')"
+	found="$(
+		find "$root" -type f \
+			\( \
+				-name "$name" -o \
+				-name "${name}.bin" -o \
+				-name "$alt_dash" -o \
+				-name "${alt_dash}.bin" -o \
+				-name "$alt_under" -o \
+				-name "${alt_under}.bin" -o \
+				-name "${name}-*" -o \
+				-name "${name}_*" \
+			\) 2>/dev/null | head -n1
+	)"
+	[ -n "$found" ] && {
+		echo "$found"
+		return 0
+	}
+	return 1
+}
+
+extract_archive() {
+	local archive="$1"
+	local dest_dir="$2"
+
+	case "$(printf '%s' "$archive" | tr 'A-Z' 'a-z')" in
+		*.zip)
+			if command -v unzip >/dev/null 2>&1; then
+				unzip -qo "$archive" -d "$dest_dir" >/dev/null 2>&1 && return 0
+			fi
+			if command -v busybox >/dev/null 2>&1; then
+				busybox unzip -o "$archive" -d "$dest_dir" >/dev/null 2>&1 && return 0
+			fi
+			if command -v bsdtar >/dev/null 2>&1; then
+				bsdtar -xf "$archive" -C "$dest_dir" >/dev/null 2>&1 && return 0
+			fi
+			return 1
+		;;
+		*)
+			tar -xzf "$archive" -C "$dest_dir" >/dev/null 2>&1
+			return $?
+		;;
+	esac
+}
+
+install_binary_atomic() {
+	local src="$1"
+	local target="$2"
+	local temp_path="${target}.$$"
+
+	[ -f "$src" ] || return 1
+	is_elf_binary "$src" || return 1
+	mkdir -p "$INSTALL_BIN_DIR" >/dev/null 2>&1 || return 1
+	rm -f "$temp_path" >/dev/null 2>&1
+	cp -f "$src" "$temp_path" >/dev/null 2>&1 || {
+		rm -f "$temp_path" >/dev/null 2>&1
+		return 1
+	}
+	chmod 755 "$temp_path" >/dev/null 2>&1 || {
+		rm -f "$temp_path" >/dev/null 2>&1
+		return 1
+	}
+	is_elf_binary "$temp_path" || {
+		rm -f "$temp_path" >/dev/null 2>&1
+		return 1
+	}
+	mv -f "$temp_path" "$target" >/dev/null 2>&1 || {
+		rm -f "$temp_path" >/dev/null 2>&1
+		return 1
+	}
+	return 0
+}
+
+read_marker_field() {
+	local file="$1"
+	local key="$2"
+
+	sed -n "s/^${key}=//p" "$file" 2>/dev/null | head -n1 | tr -d '\r\n\000'
+}
+
+sync_uci_binary_path() {
+	local section="" current=""
+
+	command -v "$UCI_COMMAND" >/dev/null 2>&1 || return 0
+	section="$("$UCI_COMMAND" -q show vnt2 2>/dev/null | sed -n 's/^vnt2\.\([^.=]*\)=vnt2_cli$/\1/p' | head -n1)"
+	[ -n "$section" ] || return 0
+	current="$("$UCI_COMMAND" -q get "vnt2.${section}.vnt2_cli_bin" 2>/dev/null || true)"
+	if [ "$current" != "$TARGET_BIN" ]; then
+		"$UCI_COMMAND" -q set "vnt2.${section}.vnt2_cli_bin=${TARGET_BIN}" >/dev/null 2>&1 || return 1
+	fi
+	current="$("$UCI_COMMAND" -q get "vnt2.${section}.vnt2_ctrl_bin" 2>/dev/null || true)"
+	if [ -f "$TARGET_CTRL_BIN" ] && [ "$current" != "$TARGET_CTRL_BIN" ]; then
+		"$UCI_COMMAND" -q set "vnt2.${section}.vnt2_ctrl_bin=${TARGET_CTRL_BIN}" >/dev/null 2>&1 || return 1
+	fi
+	"$UCI_COMMAND" commit vnt2 >/dev/null 2>&1
+	return $?
+}
+
+queue_restart() {
+	local temp="${RESTART_PENDING_FILE}.$$"
+
+	if (umask 077; printf '%s\n' "$(date +%s)" >"$temp"); then
+		mv -f "$temp" "$RESTART_PENDING_FILE" >/dev/null 2>&1 && return 0
+	fi
+	rm -f "$temp" >/dev/null 2>&1
+	return 1
+}
+
+cleanup_stale_workdirs() {
+	local path
+
+	[ -d "$UPLOAD_DIR" ] || return 0
+	for path in "$UPLOAD_DIR"/work.*; do
+		[ -d "$path" ] || continue
+		rm -rf "$path" >/dev/null 2>&1
+	done
+}
+
+process_claimed() {
+	local upload_path upload_name upload_asset work_dir source_bin ctrl_bin rc=1 arch archive_kind ctrl_note=""
+
+	[ -f "$CLAIMED_FILE" ] || return 0
+	upload_path="$(read_marker_field "$CLAIMED_FILE" path)"
+	upload_name="$(read_marker_field "$CLAIMED_FILE" name)"
+	upload_asset="$(basename "${upload_name:-vnt2_cli}")"
+	arch="$(detect_arch_name)"
+
+	case "$upload_path" in
+		"${UPLOAD_DIR}/incoming."*) ;;
+		*)
+			log_worker "upload rejected: invalid staged path"
+			write_state "failed" "upload rejected: invalid staged path" "$upload_asset" "" "$arch" ""
+			return 1
+		;;
+	esac
+	if [ ! -f "$upload_path" ] || [ -L "$upload_path" ]; then
+		log_worker "upload rejected: staged file is missing or not regular"
+		write_state "failed" "upload rejected: staged file is missing or not regular" "$upload_asset" "" "$arch" ""
+		return 1
+	fi
+
+	write_state "processing" "uploaded file is being validated and installed" "$upload_asset" "" "$arch" ""
+	log_worker "upload worker starts processing asset=${upload_asset}"
+	work_dir="${UPLOAD_DIR}/work.$$"
+	rm -rf "$work_dir" >/dev/null 2>&1
+	if ! mkdir -p "$work_dir" >/dev/null 2>&1; then
+		log_worker "upload failed: unable to create work directory"
+		write_state "failed" "upload failed: unable to create work directory" "$upload_asset" "" "$arch" ""
+		rm -f "$upload_path" >/dev/null 2>&1
+		return 1
+	fi
+	if ! chmod 700 "$work_dir" >/dev/null 2>&1; then
+		log_worker "upload failed: unable to secure work directory"
+		write_state "failed" "upload failed: unable to secure work directory" "$upload_asset" "" "$arch" ""
+		rm -rf "$work_dir" >/dev/null 2>&1
+		rm -f "$upload_path" >/dev/null 2>&1
+		return 1
+	fi
+
+	# The container format is recognized by the file content, not by the
+	# staged file name; the original upload name only picks the extraction
+	# branch. Extension comparisons are case insensitive.
+	case "$(printf '%s' "$upload_name" | tr 'A-Z' 'a-z')" in
+		*.zip)
+			archive_kind="zip"
+			if ! zip_archive_is_safe "$upload_path"; then
+				log_worker "upload rejected: unsafe or invalid zip archive"
+				write_state "failed" "upload rejected: unsafe or invalid zip archive" "$upload_asset" "" "$arch" ""
+			elif ! extract_archive "$upload_path" "$work_dir" >/dev/null 2>&1; then
+				log_worker "upload rejected: archive extraction failed"
+				write_state "failed" "upload rejected: archive extraction failed" "$upload_asset" "" "$arch" ""
+			elif ! source_bin="$(locate_extracted_bin "$work_dir" "vnt2_cli")"; then
+				log_worker "upload rejected: archive does not contain vnt2_cli"
+				write_state "failed" "upload rejected: archive does not contain vnt2_cli" "$upload_asset" "" "$arch" ""
+			elif install_binary_atomic "$source_bin" "$TARGET_BIN"; then
+				ctrl_bin="$(locate_extracted_bin "$work_dir" "vnt2_ctrl" 2>/dev/null || true)"
+				if [ -n "$ctrl_bin" ] && install_binary_atomic "$ctrl_bin" "$TARGET_CTRL_BIN"; then
+					ctrl_note=" (vnt2_ctrl installed)"
+				elif [ -n "$ctrl_bin" ]; then
+					log_worker "upload warning: extracted vnt2_ctrl is not a valid ELF binary; kept existing control tool"
+					ctrl_note=" (vnt2_ctrl invalid, kept existing)"
+				else
+					log_worker "upload note: archive has no vnt2_ctrl; kept existing control tool"
+					ctrl_note=" (vnt2_ctrl absent, kept existing)"
+				fi
+				rc=0
+			else
+				log_worker "upload failed: extracted vnt2_cli is not a valid ELF binary"
+				write_state "failed" "upload failed: extracted vnt2_cli is not a valid ELF binary" "$upload_asset" "" "$arch" ""
+			fi
+		;;
+		*.tar.gz|*.tgz)
+			archive_kind="tar.gz"
+			if ! tar_archive_is_safe "$upload_path"; then
+				log_worker "upload rejected: unsafe or invalid tar.gz archive"
+				write_state "failed" "upload rejected: unsafe or invalid tar.gz archive" "$upload_asset" "" "$arch" ""
+			elif ! tar -xzf "$upload_path" -C "$work_dir" >/dev/null 2>&1; then
+				log_worker "upload rejected: archive extraction failed"
+				write_state "failed" "upload rejected: archive extraction failed" "$upload_asset" "" "$arch" ""
+			elif ! source_bin="$(locate_extracted_bin "$work_dir" "vnt2_cli")"; then
+				log_worker "upload rejected: archive does not contain vnt2_cli"
+				write_state "failed" "upload rejected: archive does not contain vnt2_cli" "$upload_asset" "" "$arch" ""
+			elif install_binary_atomic "$source_bin" "$TARGET_BIN"; then
+				ctrl_bin="$(locate_extracted_bin "$work_dir" "vnt2_ctrl" 2>/dev/null || true)"
+				if [ -n "$ctrl_bin" ] && install_binary_atomic "$ctrl_bin" "$TARGET_CTRL_BIN"; then
+					ctrl_note=" (vnt2_ctrl installed)"
+				elif [ -n "$ctrl_bin" ]; then
+					log_worker "upload warning: extracted vnt2_ctrl is not a valid ELF binary; kept existing control tool"
+					ctrl_note=" (vnt2_ctrl invalid, kept existing)"
+				else
+					log_worker "upload note: archive has no vnt2_ctrl; kept existing control tool"
+					ctrl_note=" (vnt2_ctrl absent, kept existing)"
+				fi
+				rc=0
+			else
+				log_worker "upload failed: extracted vnt2_cli is not a valid ELF binary"
+				write_state "failed" "upload failed: extracted vnt2_cli is not a valid ELF binary" "$upload_asset" "" "$arch" ""
+			fi
+		;;
+		*)
+			if install_binary_atomic "$upload_path" "$TARGET_BIN"; then
+				rc=0
+			else
+				log_worker "upload failed: uploaded file is not a valid ELF binary"
+				write_state "failed" "upload failed: uploaded file is not a valid ELF binary" "$upload_asset" "" "$arch" ""
+			fi
+		;;
+	esac
+
+	if [ "$rc" -eq 0 ]; then
+		clear_version_state
+		sync_uci_binary_path
+		write_state "success" "uploaded binary installed to /usr/bin${ctrl_note}" "$upload_asset" "" "$arch" "$TARGET_BIN"
+		if queue_restart; then
+			log_worker "upload worker installed asset=${upload_asset} target=${TARGET_BIN}${ctrl_note} restart_queued=1"
+		else
+			log_worker "upload worker installed asset=${upload_asset} target=${TARGET_BIN}${ctrl_note} restart_queued=0"
+		fi
+	else
+		log_worker "upload worker failed asset=${upload_asset}"
+	fi
+
+	rm -rf "$work_dir" >/dev/null 2>&1
+	rm -f "$upload_path" >/dev/null 2>&1
+	return "$rc"
+}
+
+claim_pending() {
+	[ -f "$PENDING_FILE" ] || return 1
+	mv -f "$PENDING_FILE" "$CLAIMED_FILE" 2>/dev/null
+}
+
+trap 'exit 0' INT TERM
+cleanup_stale_workdirs
+
+while :; do
+	if [ ! -f "$CLAIMED_FILE" ]; then
+		claim_pending || {
+			sleep "$POLL_INTERVAL"
+			continue
+		}
+	fi
+
+	process_claimed || true
+	rm -f "$CLAIMED_FILE" >/dev/null 2>&1
+done
