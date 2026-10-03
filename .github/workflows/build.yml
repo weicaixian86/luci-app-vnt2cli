@@ -49,7 +49,9 @@ jobs:
           while IFS= read -r candidate; do
             tr -d '\r' <"$candidate" >"$makefile"
             if grep -q '^PKG_NAME:=luci-app-vnt2cli[[:space:]]*$' "$makefile"; then
-              found="$(dirname "$candidate")"
+              # Output an absolute path: later steps run with a different
+              # working directory (sdk/), where relative paths would break.
+              found="$(cd "$(dirname "$candidate")" && pwd)"
               break
             fi
           done < <(find . -name Makefile -type f)
@@ -100,7 +102,12 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install luci
           cp -r "${{ steps.pkgdir.outputs.dir }}" package/luci-app-vnt2cli
+          # A fresh SDK does not select newly added packages. Enable the package
+          # explicitly so defconfig pulls in its dependencies and the compile
+          # target actually produces an artifact.
+          echo "CONFIG_PACKAGE_luci-app-vnt2cli=m" >> .config
           make defconfig
+          grep -E '^CONFIG_PACKAGE_luci-app-vnt2cli=' .config
           make package/luci-app-vnt2cli/compile V=s -j"$(nproc)"
 
       - name: Collect artifact
