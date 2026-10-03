@@ -161,7 +161,9 @@ for pattern in \
 	'version-worker' \
 	'preview-worker' \
 	'vnt_current_config' \
-	'releases/latest'; do
+	'releases/latest' \
+	'act_config_' \
+	'vnt2_config'; do
 	hits=$(grep -rn -- "$pattern" "${PKG_DIR}/root" "${PKG_DIR}/luasrc" 2>/dev/null | grep -v 'Binary file' || true)
 	if [ -n "$hits" ]; then
 		fail "forbidden reference '${pattern}' found:"
@@ -202,8 +204,7 @@ for f in \
 	"${PKG_DIR}/root/lib/upgrade/keep.d/vnt2cli" \
 	"${PKG_DIR}/luasrc/controller/vnt2.lua" \
 	"${PKG_DIR}/luasrc/model/cbi/vnt2.lua" \
-	"${PKG_DIR}/luasrc/view/vnt2/vnt2_status.htm" \
-	"${PKG_DIR}/luasrc/view/vnt2/vnt2_config.htm"; do
+	"${PKG_DIR}/luasrc/view/vnt2/vnt2_status.htm"; do
 	if [ -f "$f" ]; then
 		ok
 	else

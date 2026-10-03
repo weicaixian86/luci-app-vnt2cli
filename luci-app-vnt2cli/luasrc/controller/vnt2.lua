@@ -12,8 +12,6 @@ local CLIENT_LOG_FILE = "/tmp/logs/vnt2.log"
 local CLIENT_LOG_DIR = "/tmp/logs"
 local DOWNLOAD_LOG_FILE = "/tmp/vnt2-download.log"
 local DOWNLOAD_STATE_FILE = "/tmp/vnt2-download-cli.state"
-local RESTART_PENDING_FILE = "/tmp/vnt2-restart.pending"
-local CONFIG_DIR = "/vnt_config"
 
 function index()
 	if not fs.access("/etc/config/vnt2") then
@@ -22,18 +20,13 @@ function index()
 
 	entry({ "admin", "vpn", "vnt2" }, alias("admin", "vpn", "vnt2", "config"), _("VNT2"), 45).dependent = true
 	entry({ "admin", "vpn", "vnt2", "config" }, cbi("vnt2"), _("基本设置"), 10).leaf = true
-	entry({ "admin", "vpn", "vnt2", "file" }, template("vnt2/vnt2_config"), _("配置管理"), 20).leaf = true
+	entry({ "admin", "vpn", "vnt2", "info" }, template("vnt2/vnt2_status"), _("运行信息"), 20).leaf = true
 	entry({ "admin", "vpn", "vnt2", "runtime_log" }, cbi("vnt2_runtime_log"), _("运行日志"), 30).leaf = true
 
 	entry({ "admin", "vpn", "vnt2", "status" }, call("act_status")).leaf = true
 	entry({ "admin", "vpn", "vnt2", "ctrl_query" }, call("act_ctrl_query")).leaf = true
 	entry({ "admin", "vpn", "vnt2", "get_runtime_log" }, call("get_runtime_log")).leaf = true
 	entry({ "admin", "vpn", "vnt2", "clear_runtime_log" }, call("clear_runtime_log")).leaf = true
-	entry({ "admin", "vpn", "vnt2", "config_list" }, call("act_config_list")).leaf = true
-	entry({ "admin", "vpn", "vnt2", "config_read" }, call("act_config_read")).leaf = true
-	entry({ "admin", "vpn", "vnt2", "config_save" }, call("act_config_save")).leaf = true
-	entry({ "admin", "vpn", "vnt2", "config_delete" }, call("act_config_delete")).leaf = true
-	entry({ "admin", "vpn", "vnt2", "config_use" }, call("act_config_use")).leaf = true
 end
 
 local function trim(s)
@@ -85,90 +78,6 @@ end
 
 local function get_active_conf()
 	return uci_first("vnt2_cli", "conf_file", "")
-end
-
-local function is_safe_toml_name(name)
-	if type(name) ~= "string" or name == "" or #name > 255 then
-		return false
-	end
-	if not name:match("%.toml$") then
-		return false
-	end
-	if name:sub(1, 1) == "." then
-		return false
-	end
-	if name:find("..", 1, true) or name:find("/", 1, true) or name:find("\\", 1, true) then
-		return false
-	end
-	if not name:match("^[%w%._%-]+$") then
-		return false
-	end
-	return true
-end
-
-local function list_toml_configs()
-	local out = {}
-
-	if not fs.access(CONFIG_DIR) then
-		return out
-	end
-
-	for name in fs.dir(CONFIG_DIR) do
-		local path = CONFIG_DIR .. "/" .. name
-		if is_safe_toml_name(name) then
-			local stat = fs.stat(path)
-			if stat and stat.type == "reg" then
-				out[#out + 1] = name
-			end
-		end
-	end
-	table.sort(out)
-	return out
-end
-
-local function atomic_write_toml(path, content)
-	local tmp = string.format("%s.%s.tmp", path, tostring(os.time()))
-	if not fs.writefile(tmp, content) then
-		fs.remove(tmp)
-		return false
-	end
-	if not fs.chmod(tmp, "0600") then
-		fs.remove(tmp)
-		return false
-	end
-	if not os.rename(tmp, path) then
-		fs.remove(tmp)
-		return false
-	end
-	return true
-end
-
-local function queue_restart()
-	local stat = fs.readfile("/proc/self/stat") or ""
-	local pid = stat:match("^(%d+)") or tostring(os.time())
-	local temp = string.format("%s.%s", RESTART_PENDING_FILE, pid)
-	local ok = fs.writefile(temp, tostring(os.time()) .. "\n")
-	if ok then
-		ok = os.rename(temp, RESTART_PENDING_FILE) and true or false
-	end
-	if not ok then
-		fs.remove(temp)
-	end
-	return ok
-end
-
-local function set_conf_file(name)
-	local section = uci:get_first("vnt2", "vnt2_cli")
-	if not section then
-		return false
-	end
-	if name and name ~= "" then
-		uci:set("vnt2", section, "conf_file", name)
-	else
-		uci:delete("vnt2", section, "conf_file")
-	end
-	uci:commit("vnt2")
-	return queue_restart()
 end
 
 local function get_pid_by_name(name)
@@ -615,122 +524,4 @@ function clear_runtime_log()
 	end
 	fs.remove(DOWNLOAD_STATE_FILE)
 	json_write({ ok = true })
-end
-
-function act_config_list()
-	json_write({
-		ok = true,
-		active = get_active_conf(),
-		configs = list_toml_configs()
-	})
-end
-
-function act_config_read()
-	local name = trim(http.formvalue("name") or "")
-	if not is_safe_toml_name(name) then
-		json_write({ ok = false, error = "配置文件名不安全" })
-		return
-	end
-
-	local path = CONFIG_DIR .. "/" .. name
-	local stat = fs.stat(path)
-	if not stat or stat.type ~= "reg" then
-		json_write({ ok = false, error = "配置文件不存在" })
-		return
-	end
-
-	json_write({
-		ok = true,
-		name = name,
-		active = get_active_conf() == name,
-		content = textutil.sanitize_text(fs.readfile(path) or "")
-	})
-end
-
-function act_config_save()
-	local name = trim(http.formvalue("name") or "")
-	local content = http.formvalue("content")
-	if type(content) == "table" then
-		content = table.concat(content, "\n")
-	end
-	content = tostring(content or ""):gsub("%z", "")
-
-	local hint = ""
-
-	if not is_safe_toml_name(name) then
-		json_write({ ok = false, error = "配置文件名不安全：只能包含字母、数字、点、下划线、短横线，且以 .toml 结尾" })
-		return
-	end
-	if trim(content) == "" then
-		json_write({ ok = false, error = "配置内容不能为空" })
-		return
-	end
-	if content:match("^%s*ctrl_port%s*=") or content:match("[\r\n]%s*ctrl_port%s*=") then
-		hint = "检测到 TOML 中的 ctrl_port 字段：启动时插件会以命令行 --ctrl-port 覆盖该值。"
-	end
-	hint = hint .. "仅执行基础校验（文件名/非空），TOML 语法错误会在客户端运行日志中体现。"
-
-	if not fs.access(CONFIG_DIR) then
-		fs.mkdirr(CONFIG_DIR)
-	end
-	fs.chmod(CONFIG_DIR, "0700")
-
-	local path = CONFIG_DIR .. "/" .. name
-	local existed = fs.access(path) and true or false
-	if not atomic_write_toml(path, content) then
-		json_write({ ok = false, error = "保存配置失败" })
-		return
-	end
-
-	json_write({ ok = true, name = name, overwrite = existed, hint = hint })
-end
-
-function act_config_delete()
-	local name = trim(http.formvalue("name") or "")
-	if not is_safe_toml_name(name) then
-		json_write({ ok = false, error = "配置文件名不安全" })
-		return
-	end
-
-	local path = CONFIG_DIR .. "/" .. name
-	local stat = fs.stat(path)
-	if not stat or stat.type ~= "reg" then
-		json_write({ ok = false, error = "配置文件不存在" })
-		return
-	end
-
-	if not fs.remove(path) then
-		json_write({ ok = false, error = "删除配置失败" })
-		return
-	end
-
-	if get_active_conf() == name then
-		set_conf_file("")
-	else
-		queue_restart()
-	end
-
-	json_write({ ok = true, name = name })
-end
-
-function act_config_use()
-	local name = trim(http.formvalue("name") or "")
-	if not is_safe_toml_name(name) then
-		json_write({ ok = false, error = "配置文件名不安全" })
-		return
-	end
-
-	local path = CONFIG_DIR .. "/" .. name
-	local stat = fs.stat(path)
-	if not stat or stat.type ~= "reg" then
-		json_write({ ok = false, error = "配置文件不存在" })
-		return
-	end
-
-	if not set_conf_file(name) then
-		json_write({ ok = false, error = "切换启用配置失败" })
-		return
-	end
-
-	json_write({ ok = true, name = name })
 end

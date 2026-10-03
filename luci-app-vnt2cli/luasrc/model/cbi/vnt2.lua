@@ -11,8 +11,6 @@ local MAX_UPLOAD_SIZE = 256 * 1024 * 1024
 
 local m = Map("vnt2")
 
-m:section(SimpleSection).template = "vnt2/vnt2_status"
-
 local function trim(v)
 	if v == nil then
 		return ""
@@ -244,7 +242,7 @@ local conf_path = w:taboption("general", DummyValue, "_conf_path", translate("�
 conf_path.cfgvalue = function()
 	return "/vnt_config/*.toml"
 end
-conf_path.description = translate("运行时配置目录固定为 /vnt_config；请在“配置管理”页新建、编辑 TOML 配置")
+conf_path.description = translate("运行时配置目录固定为 /vnt_config；TOML 配置文件请通过 SSH 创建和维护")
 
 local conf_file = w:taboption("general", ListValue, "conf_file", translate("启用配置文件"))
 conf_file.rmempty = true
@@ -264,7 +262,7 @@ if active_conf and active_conf ~= "" and not active_listed then
 	conf_file:value(active_conf, active_conf .. " (" .. translate("文件缺失") .. ")")
 end
 if #conf_options == 0 then
-	conf_file.description = translate("配置目录为空：请先前往“配置管理”页新建一个 TOML 配置，再回到此处选择启用")
+	conf_file.description = translate("配置目录为空：请通过 SSH 在 /vnt_config/ 目录下创建 TOML 配置文件后，回到此处选择启用")
 else
 	conf_file.description = translate("同一时刻只有一个 TOML 配置被 vnt2_cli 加载；切换后由后台 worker 重启生效")
 end
