@@ -102,6 +102,11 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install luci
           cp -r "${{ steps.pkgdir.outputs.dir }}" package/luci-app-vnt2cli
+          # luci.mk packages root/ with cp -pR (mode preserving). Ensure the
+          # service scripts keep their executable bit even if the git blob
+          # mode ever regresses (e.g. committed from a Windows checkout).
+          chmod 0755 package/luci-app-vnt2cli/root/etc/init.d/* \
+                     package/luci-app-vnt2cli/root/usr/libexec/vnt2/*
           # A fresh SDK does not select newly added packages. Enable the package
           # explicitly so defconfig pulls in its dependencies and the compile
           # target actually produces an artifact.
