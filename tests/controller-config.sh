@@ -156,9 +156,11 @@ assert_not_contains "$MODEL" '配置管理' "no stale config page references in 
 # --- status view ---
 assert_contains "$STATUSMODEL" 'SimpleForm("vnt2", translate("运行信息"))' "runtime info page uses the standard form chrome"
 assert_contains "$STATUSMODEL" 'Template("vnt2/vnt2_status")' "runtime info page embeds the status template"
-assert_contains "$STATUS" 'vnt2_cli 客户端状态' "status card title"
-assert_contains "$STATUS" '运行信息' "runtime info card"
+assert_contains "$STATUS" '运行状态' "status card title"
+assert_contains "$STATUS" '虚拟网络' "virtual network card"
 assert_contains "$STATUS" 'fieldset class="cbi-section' "cards use theme section styling"
+assert_contains "$STATUS" '客户端未运行' "lists hidden with a hint when client stopped"
+assert_contains "$STATUS" 'vnt2_clients_card' "list cards have toggle ids"
 assert_contains "$STATUS" '节点列表' "clients list card"
 assert_contains "$STATUS" '路由列表' "routes list card"
 assert_contains "$STATUS" 'escapeHtml' "dynamic text escaped in JS"

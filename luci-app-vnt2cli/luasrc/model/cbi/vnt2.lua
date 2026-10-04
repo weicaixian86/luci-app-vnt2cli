@@ -782,7 +782,7 @@ local function add_flag(tab, name, label, description)
 	return flag
 end
 
-add_flag("tunnel", "rtx", "启用 quic 优化传输", "损失部分兼容性换取更好的弱网表现")
+add_flag("tunnel", "rtx", "启用 quic 优化传输", nil)
 add_flag("tunnel", "compress", "启用 LZ4 压缩", nil)
 add_flag("tunnel", "fec", "启用 FEC 前向纠错", "损失一定带宽提升网络稳定性")
 add_flag("tunnel", "no_punch", "关闭自动 P2P 打洞", "显式直连节点地址仍可连接")

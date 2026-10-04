@@ -88,42 +88,50 @@ local ctrl_query_url = dsp.build_url("admin", "vpn", "vnt2", "ctrl_query")
 		margin: 6px 0 2px;
 		font-size: 12px;
 	}
+	.vnt2-lists-hint {
+		font-size: 13px;
+		color: #888;
+		padding: 8px 10px;
+	}
 </style>
 
 <div class="vnt2-status-wrap">
 	<fieldset class="cbi-section vnt2-card">
 		<h3>
-			vnt2_cli 客户端状态
+			运行状态
 			<span id="cli_status_badge" class="vnt2-badge vnt2-off">未运行</span>
 		</h3>
 		<table>
-			<tr><td>本地版本</td><td id="cli_tag">-</td></tr>
-			<tr><td>目标版本</td><td id="cli_target_tag">-</td></tr>
 			<tr><td>运行时长</td><td id="cli_runtime">-</td></tr>
 			<tr><td>进程/PID</td><td id="cli_pid">-</td></tr>
 			<tr><td>CPU / 内存</td><td id="cli_usage">-</td></tr>
 			<tr><td>日志级别</td><td id="cli_log_level">-</td></tr>
+			<tr><td>本地版本</td><td id="cli_tag">-</td></tr>
+			<tr><td>目标版本</td><td id="cli_target_tag">-</td></tr>
 			<tr><td>下载状态</td><td id="cli_download">-</td></tr>
 		</table>
 	</fieldset>
 
 	<fieldset class="cbi-section vnt2-card">
-		<h3>运行信息 <span id="ctrl_state_note" style="font-size:13px; font-weight:400; color:#888;"></span></h3>
+		<h3>虚拟网络 <span id="ctrl_state_note" style="font-size:13px; font-weight:400; color:#888;"></span></h3>
 		<table>
 			<tr><td>服务器</td><td id="ctrl_server">-</td></tr>
+			<tr><td>最近连接</td><td id="ctrl_last_connected">-</td></tr>
 			<tr><td>设备名称</td><td id="ctrl_name">-</td></tr>
 			<tr><td>设备 ID</td><td id="ctrl_device_id">-</td></tr>
-			<tr><td>客户端版本</td><td id="ctrl_version">-</td></tr>
 			<tr><td>虚拟 IP</td><td id="ctrl_ip">-</td></tr>
 			<tr><td>节点数</td><td id="ctrl_clients_summary">-</td></tr>
 			<tr><td>NAT 类型</td><td id="ctrl_nat_type">-</td></tr>
 			<tr><td>公网 IPv4</td><td id="ctrl_public_ipv4">-</td></tr>
 			<tr><td>IPv6</td><td id="ctrl_public_ipv6">-</td></tr>
-			<tr><td>最近连接</td><td id="ctrl_last_connected">-</td></tr>
 		</table>
 	</fieldset>
 
-	<fieldset class="cbi-section vnt2-card">
+	<div id="vnt2_lists_hint" class="vnt2-lists-hint" style="display:none;">
+		客户端未运行，启动后此处展示节点与路由列表。
+	</div>
+
+	<fieldset class="cbi-section vnt2-card" id="vnt2_clients_card" style="display:none;">
 		<h3>节点列表</h3>
 		<div class="vnt2-log-toolbar">
 			<label><input type="checkbox" id="ctrl_clients_refresh" checked="checked" /> <%:自动刷新%></label>
@@ -132,7 +140,7 @@ local ctrl_query_url = dsp.build_url("admin", "vpn", "vnt2", "ctrl_query")
 		<pre class="vnt2-pre" id="ctrl_clients_text">-</pre>
 	</fieldset>
 
-	<fieldset class="cbi-section vnt2-card">
+	<fieldset class="cbi-section vnt2-card" id="vnt2_routes_card" style="display:none;">
 		<h3>路由列表</h3>
 		<div class="vnt2-log-toolbar">
 			<label><input type="checkbox" id="ctrl_route_refresh" checked="checked" /> <%:自动刷新%></label>
@@ -182,23 +190,11 @@ local ctrl_query_url = dsp.build_url("admin", "vpn", "vnt2", "ctrl_query")
 		}
 	}
 
-	function setText(id, value) {
-		var node = byId(id);
-		if (node) {
-			node.textContent = value;
-		}
-	}
-
 	function stateText(obj) {
-		if (!obj) return "-";
-		var items = [];
-		if (obj.state) items.push("状态：" + text(obj.state));
-		if (obj.tag) items.push("版本：" + text(obj.tag));
-		if (obj.arch) items.push("架构：" + text(obj.arch));
-		if (obj.asset) items.push("资源：" + text(obj.asset));
-		if (obj.message) items.push(text(obj.message));
-		if (obj.time) items.push("时间：" + text(obj.time));
-		return items.length ? items.join("<br />") : "-";
+		if (!obj || !obj.state) return "-";
+		var out = text(obj.state);
+		if (obj.message) out += "：" + text(obj.message);
+		return out;
 	}
 
 	function checked(id) {
@@ -206,15 +202,26 @@ local ctrl_query_url = dsp.build_url("admin", "vpn", "vnt2", "ctrl_query")
 		return node && node.checked;
 	}
 
-	function render(data) {
-		setBadge("cli_status_badge", data.cli_running);
+	function setListsVisible(running) {
+		var clients = byId("vnt2_clients_card");
+		var routes = byId("vnt2_routes_card");
+		var hint = byId("vnt2_lists_hint");
+		if (clients) clients.style.display = running ? "" : "none";
+		if (routes) routes.style.display = running ? "" : "none";
+		if (hint) hint.style.display = running ? "none" : "";
+	}
 
-		setHtml("cli_tag", text(data.cli_tag));
-		setHtml("cli_target_tag", text(data.cli_target_tag));
+	function render(data) {
+		var running = !!data.cli_running;
+		setBadge("cli_status_badge", running);
+		setListsVisible(running);
+
 		setHtml("cli_runtime", text(data.cli_runtime));
-		setHtml("cli_pid", data.cli_running ? ("PID " + text(data.cli_pid)) : "未运行");
+		setHtml("cli_pid", running ? ("PID " + text(data.cli_pid)) : "未运行");
 		setHtml("cli_usage", [text(data.cli_cpu, "0"), text(data.cli_ram, "0 MB")].join(" / "));
 		setHtml("cli_log_level", text(data.log_level));
+		setHtml("cli_tag", text(data.cli_tag));
+		setHtml("cli_target_tag", text(data.cli_target_tag));
 		setHtml("cli_download", stateText(data.cli_download));
 
 		var info = data.ctrl_info;
@@ -228,9 +235,9 @@ local ctrl_query_url = dsp.build_url("admin", "vpn", "vnt2", "ctrl_query")
 				server += " (" + info.server_status + ")";
 			}
 			setHtml("ctrl_server", text(server));
+			setHtml("ctrl_last_connected", text(info.last_connected));
 			setHtml("ctrl_name", text(info.name));
 			setHtml("ctrl_device_id", text(info.device_id));
-			setHtml("ctrl_version", text(info.version));
 			setHtml("ctrl_ip", text(info.ip));
 			setHtml("ctrl_clients_summary",
 				text(info.online_clients, "0") + " 在线 / " + text(info.total_clients, "0") + " 总数 / " +
@@ -238,19 +245,18 @@ local ctrl_query_url = dsp.build_url("admin", "vpn", "vnt2", "ctrl_query")
 			setHtml("ctrl_nat_type", text(info.nat_type));
 			setHtml("ctrl_public_ipv4", text(info.public_ipv4));
 			setHtml("ctrl_public_ipv6", text(info.public_ipv6));
-			setHtml("ctrl_last_connected", text(info.last_connected));
 		} else {
 			setHtml("ctrl_server", "-");
+			setHtml("ctrl_last_connected", data.ctrl_error ? "<span style='color:#888;'>" + escapeHtml(data.ctrl_error) + "</span>" : "-");
 			setHtml("ctrl_name", "-");
 			setHtml("ctrl_device_id", "-");
-			setHtml("ctrl_version", "-");
 			setHtml("ctrl_ip", "-");
 			setHtml("ctrl_clients_summary", "-");
 			setHtml("ctrl_nat_type", "-");
 			setHtml("ctrl_public_ipv4", "-");
 			setHtml("ctrl_public_ipv6", "-");
-			setHtml("ctrl_last_connected", data.ctrl_error ? "<span style='color:#888;'>" + escapeHtml(data.ctrl_error) + "</span>" : "-");
 		}
+		return running;
 	}
 
 	function fetchCtrlText(what) {
@@ -266,13 +272,10 @@ local ctrl_query_url = dsp.build_url("admin", "vpn", "vnt2", "ctrl_query")
 	}
 	window.fetchCtrlText = fetchCtrlText;
 
-	function updateStatus() {
-		XHR.get(statusUrl, null, function(x, data) {
-			if (!data) {
-				return;
-			}
-			render(data);
-		});
+	var lastRunning = false;
+
+	function updateLists() {
+		if (!lastRunning) return;
 		if (checked("ctrl_clients_refresh")) {
 			fetchCtrlText("clients");
 		}
@@ -281,8 +284,27 @@ local ctrl_query_url = dsp.build_url("admin", "vpn", "vnt2", "ctrl_query")
 		}
 	}
 
+	function updateStatus() {
+		XHR.get(statusUrl, null, function(x, data) {
+			if (!data) {
+				return;
+			}
+			var running = render(data);
+			if (running && !lastRunning) {
+				// The client just came up: refresh the lists once immediately.
+				lastRunning = running;
+				updateLists();
+				return;
+			}
+			lastRunning = running;
+		});
+	}
+
 	updateStatus();
 	window.setInterval(updateStatus, 5000);
+	// Client and route lists refresh at half the status rate to keep the
+	// request load on the router low.
+	window.setInterval(updateLists, 10000);
 })();
 //]]>
 </script>
