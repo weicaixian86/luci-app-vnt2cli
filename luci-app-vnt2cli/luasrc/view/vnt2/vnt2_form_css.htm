@@ -1,0 +1,27 @@
+<style type="text/css">
+/* luci-compat form compaction for this page: pull the label column back to
+   the left edge instead of the theme's wide fixed-width title gutter. */
+#maincontent .cbi-value {
+	display: flex !important;
+	align-items: flex-start;
+	gap: 8px;
+}
+#maincontent .cbi-value > .cbi-value-title {
+	flex: 0 0 auto;
+	width: auto !important;
+	max-width: 50%;
+	float: none !important;
+	display: block !important;
+	margin: 0 !important;
+	text-align: left;
+	padding-top: 2px;
+	word-break: break-word;
+}
+#maincontent .cbi-value > .cbi-value-field {
+	flex: 1 1 auto;
+	min-width: 0;
+	width: auto !important;
+	float: none !important;
+	margin: 0 !important;
+}
+</style>

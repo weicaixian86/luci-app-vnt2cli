@@ -83,6 +83,7 @@ assert_contains "$CTRL" '已废弃键 no_tun' "editor rejects deprecated no_tun 
 assert_contains "$CTRL" 'tunnel_addr 与 tunnel_port 互斥' "editor enforces tunnel mutual exclusion"
 assert_contains "$MODEL" 'w:tab("edit", translate("编辑配置"))' "edit config tab registered"
 assert_contains "$MODEL" 'vnt2/vnt2_toml_edit' "edit tab renders the editor template"
+assert_contains "$MODEL" 'vnt2/vnt2_form_css' "form css compaction template attached"
 assert_contains "$MODEL" 'w:tab("upload", translate("上传程序"))' "upload tab still registered"
 if [ -f "${PKG_DIR}/luasrc/view/vnt2/vnt2_toml_edit.htm" ]; then
 	checks=$((checks + 1))

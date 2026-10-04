@@ -10,6 +10,10 @@ local MAX_UPLOAD_SIZE = 256 * 1024 * 1024
 
 local m = Map("vnt2")
 
+-- Page-scoped CSS: pull the label column back to the left edge so the form
+-- rows start at the section border instead of after a wide empty gutter.
+m:section(SimpleSection).template = "vnt2/vnt2_form_css"
+
 local function trim(v)
 	if v == nil then
 		return ""
