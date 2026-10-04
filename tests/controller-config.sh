@@ -71,6 +71,35 @@ assert_contains "$CTRL" 'parse_ctrl_info' "control info parsed into fields"
 assert_contains "$CTRL" 'textutil.sanitize_text(out)' "ctrl output ANSI-stripped"
 assert_contains "$CTRL" 'act_ctrl_query()' "clients/route endpoint exists"
 
+# --- toml editor round-trip ---
+assert_contains "$CTRL" 'function act_toml_read()' "toml read endpoint implemented"
+assert_contains "$CTRL" 'function act_toml_save()' "toml save endpoint implemented"
+assert_contains "$CTRL" 'toml_serialize_uci' "editor reads serialize UCI to TOML"
+assert_contains "$CTRL" 'toml_parse_config' "editor save parses TOML text"
+assert_contains "$CTRL" 'toml_apply_to_uci' "editor save writes back to UCI"
+assert_contains "$CTRL" 'queue_restart' "editor save queues a client restart"
+assert_contains "$CTRL" '已废弃键 no_tun' "editor rejects deprecated no_tun key"
+assert_contains "$CTRL" 'tunnel_addr 与 tunnel_port 互斥' "editor enforces tunnel mutual exclusion"
+assert_contains "$MODEL" 'w:tab("edit", translate("编辑配置"))' "edit config tab registered"
+assert_contains "$MODEL" 'vnt2/vnt2_toml_edit' "edit tab renders the editor template"
+assert_contains "$MODEL" 'w:tab("upload", translate("上传程序"))' "upload tab still registered"
+if [ -f "${PKG_DIR}/luasrc/view/vnt2/vnt2_toml_edit.htm" ]; then
+	checks=$((checks + 1))
+else
+	echo "FAIL: vnt2_toml_edit.htm template missing"
+	failures=$((failures + 1))
+fi
+edit_line=$(grep -n 'w:tab("edit"' "$MODEL" | head -n1 | cut -d: -f1)
+upload_line=$(grep -n 'w:tab("upload"' "$MODEL" | head -n1 | cut -d: -f1)
+if [ -n "$edit_line" ] && [ -n "$upload_line" ] && [ "$edit_line" -lt "$upload_line" ]; then
+	checks=$((checks + 1))
+else
+	echo "FAIL: edit tab must come before the upload tab"
+	failures=$((failures + 1))
+fi
+assert_contains "${PKG_DIR}/luasrc/view/vnt2/vnt2_toml_edit.htm" 'toml_save' "editor template posts to save endpoint"
+assert_contains "${PKG_DIR}/luasrc/view/vnt2/vnt2_toml_edit.htm" 'vnt2TomlReload' "editor template offers reload"
+
 # --- logs ---
 assert_contains "$CTRL" '/tmp/logs/vnt2.log' "client log path"
 assert_contains "$CTRL" '/tmp/vnt2-download.log' "download log path"

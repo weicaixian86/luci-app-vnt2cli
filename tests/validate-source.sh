@@ -208,7 +208,8 @@ for f in \
 	"${PKG_DIR}/root/lib/upgrade/keep.d/vnt2cli" \
 	"${PKG_DIR}/luasrc/controller/vnt2.lua" \
 	"${PKG_DIR}/luasrc/model/cbi/vnt2.lua" \
-	"${PKG_DIR}/luasrc/view/vnt2/vnt2_status.htm"; do
+	"${PKG_DIR}/luasrc/view/vnt2/vnt2_status.htm" \
+	"${PKG_DIR}/luasrc/view/vnt2/vnt2_toml_edit.htm"; do
 	if [ -f "$f" ]; then
 		ok
 	else

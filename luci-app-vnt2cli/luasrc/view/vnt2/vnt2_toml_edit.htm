@@ -1,0 +1,102 @@
+<%
+local dsp = require "luci.dispatcher"
+local toml_read_url = dsp.build_url("admin", "vpn", "vnt2", "toml_read")
+local toml_save_url = dsp.build_url("admin", "vpn", "vnt2", "toml_save")
+%>
+
+<style type="text/css">
+	.vnt2-toml-toolbar {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		margin: 0 0 8px;
+		flex-wrap: wrap;
+	}
+	.vnt2-toml-note {
+		font-size: 12px;
+		color: #888;
+	}
+	#vnt2_toml_editor {
+		width: 100%;
+		box-sizing: border-box;
+		min-height: 380px;
+		font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+		font-size: 12px;
+		line-height: 1.5;
+		white-space: pre;
+		resize: vertical;
+	}
+	.vnt2-toml-msg {
+		font-size: 13px;
+		margin: 8px 0 0;
+		min-height: 18px;
+	}
+	.vnt2-toml-msg.ok {
+		color: #19a15f;
+	}
+	.vnt2-toml-msg.err {
+		color: #d9534f;
+	}
+</style>
+
+<div>
+	<div class="vnt2-toml-toolbar">
+		<input class="cbi-button cbi-button-apply" type="button" onclick="vnt2TomlSave()" value="<%:保存配置%>" />
+		<input class="cbi-button" type="button" onclick="vnt2TomlReload()" value="<%:重新加载%>" />
+		<span class="vnt2-toml-note"><%:此处以 TOML 文本展示当前配置；保存会解析文本写回插件配置（与基本设置页同源），并由后台重启客户端生效。直接修改 /tmp/vnt2cli.toml 无效。%></span>
+	</div>
+	<textarea id="vnt2_toml_editor" class="cbi-input-textarea" spellcheck="false" wrap="off"><%=self:cfgvalue(section)%></textarea>
+	<div class="vnt2-toml-msg" id="vnt2_toml_msg"></div>
+</div>
+
+<script type="text/javascript">
+//<![CDATA[
+(function() {
+	var readUrl = "<%=toml_read_url%>";
+	var saveUrl = "<%=toml_save_url%>";
+
+	function editor() {
+		return document.getElementById("vnt2_toml_editor");
+	}
+
+	function setMessage(text, ok) {
+		var node = document.getElementById("vnt2_toml_msg");
+		if (!node) return;
+		node.textContent = text || "";
+		node.className = "vnt2-toml-msg " + (ok ? "ok" : "err");
+	}
+
+	function reload() {
+		XHR.get(readUrl, null, function(x, data) {
+			if (data && data.ok) {
+				editor().value = data.content || "";
+				setMessage("", true);
+			} else {
+				setMessage((data && data.error) || "读取配置失败", false);
+			}
+		});
+	}
+
+	window.vnt2TomlReload = reload;
+
+	window.vnt2TomlSave = function() {
+		var content = editor().value;
+		if (!/\S/.test(content)) {
+			setMessage("配置内容不能为空", false);
+			return;
+		}
+		XHR.post(saveUrl, { content: content }, function(x, data) {
+			if (data && data.ok) {
+				setMessage(data.hint || "已保存。", true);
+			} else {
+				setMessage((data && data.error) || "保存失败", false);
+			}
+		});
+	};
+
+	if (editor() && editor().value.replace(/\s/g, "") === "") {
+		reload();
+	}
+})();
+//]]>
+</script>

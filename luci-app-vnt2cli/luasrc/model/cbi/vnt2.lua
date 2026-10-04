@@ -641,6 +641,7 @@ w:tab("device", translate("设备与网卡"))
 w:tab("tunnel", translate("传输与隧道"))
 w:tab("forward", translate("子网与转发"))
 w:tab("security", translate("安全"))
+w:tab("edit", translate("编辑配置"))
 w:tab("upload", translate("上传程序"))
 
 local enabled = w:taboption("general", Flag, "enabled", translate("启用vnt2_cli 客户端"))
@@ -905,6 +906,10 @@ tcp_stun.validate = validate_dynamic_items(validate_stun_item)
 local event_script = w:taboption("security", Value, "event_script", translate("事件脚本"))
 event_script.rmempty = true
 event_script.description = translate("网卡创建成功、掉线、重连成功、IP 变化时以参数方式调用的脚本路径/命令，可选")
+
+local toml_edit = w:taboption("edit", DummyValue, "_toml_edit")
+toml_edit.rawhtml = true
+toml_edit.template = "vnt2/vnt2_toml_edit"
 
 local cli_upload = w:taboption("upload", FileUpload, "upload_cli")
 cli_upload.optional = true
