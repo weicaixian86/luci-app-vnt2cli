@@ -6,25 +6,12 @@ local ctrl_query_url = dsp.build_url("admin", "vpn", "vnt2", "ctrl_query")
 
 <style type="text/css">
 	.vnt2-status-wrap {
-		margin: 4px 0 12px;
-	}
-	.vnt2-status-grid {
-		display: block;
-	}
-	.vnt2-card {
-		border: 1px solid var(--border-color-medium, var(--border-color-high, #d9d9d9));
-		border-radius: 4px;
-		padding: 8px 10px;
-		background: var(--card-background, var(--panel-bg, var(--background-color, #fff)));
-		color: var(--text-color, inherit);
-		box-shadow: none;
 		font-size: 14px;
 		line-height: 1.5;
-		margin-bottom: 12px;
 	}
 	.vnt2-card h3 {
-		margin: 0 0 4px;
-		font-size: 18px;
+		margin: 0 0 8px;
+		font-size: 16px;
 		font-weight: 600;
 		line-height: 1.4;
 		color: var(--text-color-high, var(--text-color, inherit));
@@ -104,58 +91,55 @@ local ctrl_query_url = dsp.build_url("admin", "vpn", "vnt2", "ctrl_query")
 </style>
 
 <div class="vnt2-status-wrap">
-	<div class="vnt2-status-grid">
-		<div class="vnt2-card">
-			<h3>
-				vnt2_cli 客户端状态
-				<span id="cli_status_badge" class="vnt2-badge vnt2-off">未运行</span>
-			</h3>
-			<table>
-				<tr><td>本地版本</td><td id="cli_tag">-</td></tr>
-				<tr><td>目标版本</td><td id="cli_target_tag">-</td></tr>
-				<tr><td>运行时长</td><td id="cli_runtime">-</td></tr>
-				<tr><td>进程/PID</td><td id="cli_pid">-</td></tr>
-				<tr><td>CPU / 内存</td><td id="cli_usage">-</td></tr>
-				<tr><td>日志级别</td><td id="cli_log_level">-</td></tr>
-				<tr><td>下载状态</td><td id="cli_download">-</td></tr>
-			</table>
-		</div>
+	<fieldset class="cbi-section vnt2-card">
+		<h3>
+			vnt2_cli 客户端状态
+			<span id="cli_status_badge" class="vnt2-badge vnt2-off">未运行</span>
+		</h3>
+		<table>
+			<tr><td>本地版本</td><td id="cli_tag">-</td></tr>
+			<tr><td>目标版本</td><td id="cli_target_tag">-</td></tr>
+			<tr><td>运行时长</td><td id="cli_runtime">-</td></tr>
+			<tr><td>进程/PID</td><td id="cli_pid">-</td></tr>
+			<tr><td>CPU / 内存</td><td id="cli_usage">-</td></tr>
+			<tr><td>日志级别</td><td id="cli_log_level">-</td></tr>
+			<tr><td>下载状态</td><td id="cli_download">-</td></tr>
+		</table>
+	</fieldset>
 
-		<div class="vnt2-card">
-			<h3>运行信息 <span id="ctrl_state_note" style="font-size:13px; font-weight:400; color:#888;"></span></h3>
-			<table>
-				<tr><td>服务器</td><td id="ctrl_server">-</td></tr>
-				<tr><td>设备名称</td><td id="ctrl_name">-</td></tr>
-				<tr><td>设备 ID</td><td id="ctrl_device_id">-</td></tr>
-				<tr><td>客户端版本</td><td id="ctrl_version">-</td></tr>
-				<tr><td>虚拟 IP</td><td id="ctrl_ip">-</td></tr>
-				<tr><td>节点数</td><td id="ctrl_clients_summary">-</td></tr>
-				<tr><td>NAT 类型</td><td id="ctrl_nat_type">-</td></tr>
-				<tr><td>公网 IPv4</td><td id="ctrl_public_ipv4">-</td></tr>
-				<tr><td>IPv6</td><td id="ctrl_public_ipv6">-</td></tr>
-				<tr><td>最近连接</td><td id="ctrl_last_connected">-</td></tr>
-			</table>
-		</div>
+	<fieldset class="cbi-section vnt2-card">
+		<h3>运行信息 <span id="ctrl_state_note" style="font-size:13px; font-weight:400; color:#888;"></span></h3>
+		<table>
+			<tr><td>服务器</td><td id="ctrl_server">-</td></tr>
+			<tr><td>设备名称</td><td id="ctrl_name">-</td></tr>
+			<tr><td>设备 ID</td><td id="ctrl_device_id">-</td></tr>
+			<tr><td>客户端版本</td><td id="ctrl_version">-</td></tr>
+			<tr><td>虚拟 IP</td><td id="ctrl_ip">-</td></tr>
+			<tr><td>节点数</td><td id="ctrl_clients_summary">-</td></tr>
+			<tr><td>NAT 类型</td><td id="ctrl_nat_type">-</td></tr>
+			<tr><td>公网 IPv4</td><td id="ctrl_public_ipv4">-</td></tr>
+			<tr><td>IPv6</td><td id="ctrl_public_ipv6">-</td></tr>
+			<tr><td>最近连接</td><td id="ctrl_last_connected">-</td></tr>
+		</table>
+	</fieldset>
 
-		<div class="vnt2-card">
-			<h3>节点列表</h3>
-			<div class="vnt2-log-toolbar">
-				<label><input type="checkbox" id="ctrl_clients_refresh" checked="checked" /> <%:自动刷新%></label>
-				<input class="cbi-button" type="button" onclick="fetchCtrlText('clients')" value="<%:立即刷新%>" />
-			</div>
-			<pre class="vnt2-pre" id="ctrl_clients_text">-</pre>
+	<fieldset class="cbi-section vnt2-card">
+		<h3>节点列表</h3>
+		<div class="vnt2-log-toolbar">
+			<label><input type="checkbox" id="ctrl_clients_refresh" checked="checked" /> <%:自动刷新%></label>
+			<input class="cbi-button" type="button" onclick="fetchCtrlText('clients')" value="<%:立即刷新%>" />
 		</div>
+		<pre class="vnt2-pre" id="ctrl_clients_text">-</pre>
+	</fieldset>
 
-		<div class="vnt2-card">
-			<h3>路由列表</h3>
-			<div class="vnt2-log-toolbar">
-				<label><input type="checkbox" id="ctrl_route_refresh" checked="checked" /> <%:自动刷新%></label>
-				<input class="cbi-button" type="button" onclick="fetchCtrlText('route')" value="<%:立即刷新%>" />
-			</div>
-			<pre class="vnt2-pre" id="ctrl_route_text">-</pre>
+	<fieldset class="cbi-section vnt2-card">
+		<h3>路由列表</h3>
+		<div class="vnt2-log-toolbar">
+			<label><input type="checkbox" id="ctrl_route_refresh" checked="checked" /> <%:自动刷新%></label>
+			<input class="cbi-button" type="button" onclick="fetchCtrlText('route')" value="<%:立即刷新%>" />
 		</div>
-	</div>
-
+		<pre class="vnt2-pre" id="ctrl_route_text">-</pre>
+	</fieldset>
 </div>
 
 <script type="text/javascript">

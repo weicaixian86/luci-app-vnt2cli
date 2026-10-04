@@ -21,7 +21,7 @@ function index()
 
 	entry({ "admin", "vpn", "vnt2" }, alias("admin", "vpn", "vnt2", "config"), _("VNT2"), 45).dependent = true
 	entry({ "admin", "vpn", "vnt2", "config" }, cbi("vnt2"), _("基本设置"), 10).leaf = true
-	entry({ "admin", "vpn", "vnt2", "info" }, template("vnt2/vnt2_status"), _("运行信息"), 20).leaf = true
+	entry({ "admin", "vpn", "vnt2", "info" }, cbi("vnt2_status"), _("运行信息"), 20).leaf = true
 	entry({ "admin", "vpn", "vnt2", "runtime_log" }, cbi("vnt2_runtime_log"), _("运行日志"), 30).leaf = true
 
 	entry({ "admin", "vpn", "vnt2", "status" }, call("act_status")).leaf = true

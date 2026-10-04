@@ -15,6 +15,7 @@ if [ -z "$PKG_DIR" ]; then
 fi
 CTRL="${PKG_DIR}/luasrc/controller/vnt2.lua"
 MODEL="${PKG_DIR}/luasrc/model/cbi/vnt2.lua"
+STATUSMODEL="${PKG_DIR}/luasrc/model/cbi/vnt2_status.lua"
 TEXT="${PKG_DIR}/luasrc/model/vnt2_text.lua"
 STATUS="${PKG_DIR}/luasrc/view/vnt2/vnt2_status.htm"
 LOGVIEW="${PKG_DIR}/luasrc/view/vnt2/vnt2_runtime_log.htm"
@@ -43,7 +44,7 @@ assert_not_contains() {
 # --- menu and pages ---
 assert_contains "$CTRL" '"admin", "vpn", "vnt2"' "menu entry under VPN"
 assert_contains "$CTRL" 'cbi("vnt2")' "basic settings page registered"
-assert_contains "$CTRL" 'template("vnt2/vnt2_status"), _("运行信息")' "runtime info page registered with status template"
+assert_contains "$CTRL" 'cbi("vnt2_status"), _("运行信息")' "runtime info page registered as cbi form"
 assert_contains "$CTRL" 'cbi("vnt2_runtime_log")' "runtime log page registered"
 assert_not_contains "$CTRL" "act_config_" "config management endpoints removed"
 assert_not_contains "$CTRL" "vnt2_config" "config management page references removed"
@@ -151,8 +152,11 @@ assert_not_contains "$MODEL" 'generate_web_token' "no web token generator"
 assert_not_contains "$MODEL" '配置管理' "no stale config page references in model"
 
 # --- status view ---
+assert_contains "$STATUSMODEL" 'SimpleForm("vnt2", translate("运行信息"))' "runtime info page uses the standard form chrome"
+assert_contains "$STATUSMODEL" 'Template("vnt2/vnt2_status")' "runtime info page embeds the status template"
 assert_contains "$STATUS" 'vnt2_cli 客户端状态' "status card title"
 assert_contains "$STATUS" '运行信息' "runtime info card"
+assert_contains "$STATUS" 'fieldset class="cbi-section' "cards use theme section styling"
 assert_contains "$STATUS" '节点列表' "clients list card"
 assert_contains "$STATUS" '路由列表' "routes list card"
 assert_contains "$STATUS" 'escapeHtml' "dynamic text escaped in JS"
