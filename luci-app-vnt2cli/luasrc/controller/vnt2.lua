@@ -880,6 +880,25 @@ function act_toml_save()
 		return
 	end
 
+	-- The text is authoritative: omitted keys are cleared. Warn when keys that
+	-- currently hold values are about to be removed by this save.
+	local cleared = {}
+	local section = uci:get_first("vnt2", "vnt2_cli")
+	if section then
+		for _, key in ipairs(TOML_EDIT_KEY_ORDER) do
+			local current = uci:get("vnt2", section, key)
+			local has_value = false
+			if type(current) == "table" then
+				has_value = #current > 0
+			elseif current ~= nil and current ~= "" then
+				has_value = true
+			end
+			if has_value and values[key] == nil then
+				cleared[#cleared + 1] = key
+			end
+		end
+	end
+
 	local ok, apply_err = toml_apply_to_uci(values)
 	if not ok then
 		json_write({ ok = false, error = apply_err })
@@ -887,7 +906,11 @@ function act_toml_save()
 	end
 
 	local restart_queued = queue_restart()
-	local hint = "已保存并写回插件配置。"
+	local hint = ""
+	if #cleared > 0 then
+		hint = "注意：以下键未出现在文本中，已被清除：" .. table.concat(cleared, "、") .. "。"
+	end
+	hint = hint .. "已保存并写回插件配置。"
 	if restart_queued then
 		hint = hint .. "后台将重启客户端使配置生效。"
 	else
