@@ -855,6 +855,14 @@ local function queue_restart()
 	return ok
 end
 
+local function config_audit(message)
+	local f = io.open("/tmp/vnt2-download.log", "a")
+	if f then
+		f:write(os.date("%Y-%m-%d %H:%M:%S") .. " config : " .. message .. "\n")
+		f:close()
+	end
+end
+
 function act_toml_read()
 	json_write({
 		ok = true,
@@ -909,6 +917,7 @@ function act_toml_save()
 	local hint = ""
 	if #cleared > 0 then
 		hint = "注意：以下键未出现在文本中，已被清除：" .. table.concat(cleared, "、") .. "。"
+		config_audit("编辑配置保存清空了以下键：" .. table.concat(cleared, "、"))
 	end
 	hint = hint .. "已保存并写回插件配置。"
 	if restart_queued then

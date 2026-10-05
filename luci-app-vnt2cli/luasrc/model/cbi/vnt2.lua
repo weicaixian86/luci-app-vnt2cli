@@ -34,6 +34,16 @@ end
 -- CBI validators may need values from sibling fields in the same form post.
 local cbi_options = {}
 
+-- Audit trail for config mutations: when a populated list gets cleared the
+-- running log records who did it, so silent losses are diagnosable.
+local function config_audit(message)
+	local f = io.open("/tmp/vnt2-download.log", "a")
+	if f then
+		f:write(os.date("%Y-%m-%d %H:%M:%S") .. " config : " .. message .. "\n")
+		f:close()
+	end
+end
+
 
 local function add_file_upload_handler(note_options)
 	local fd, uploaded_name, staged_path, upload_size, upload_rejected
@@ -595,6 +605,10 @@ local function bind_dynamiclist(option)
 
 	option.write = function(self, section, value)
 		local values = normalized_list_values(value)
+		local old = normalized_list_values(self:cfgvalue(section))
+		if #old > 0 and #values == 0 then
+			config_audit("表单保存清空了 " .. tostring(self.option) .. "（原有 " .. #old .. " 项）")
+		end
 		self.map.uci:delete(self.map.config, section, self.option)
 		if #values > 0 then
 			self.map.uci:set_list(self.map.config, section, self.option, values)
