@@ -13,6 +13,7 @@ local CLIENT_LOG_DIR = "/tmp/logs"
 local DOWNLOAD_LOG_FILE = "/tmp/vnt2-download.log"
 local DOWNLOAD_STATE_FILE = "/tmp/vnt2-download-cli.state"
 local RESTART_PENDING_FILE = "/tmp/vnt2-restart.pending"
+local RUNTIME_TOML_FILE = "/tmp/vnt2cli.toml"
 
 function index()
 	if not fs.access("/etc/config/vnt2") then
@@ -524,10 +525,12 @@ function clear_runtime_log()
 	json_write({ ok = true })
 end
 
+
 -- ---------- 编辑配置：UCI <-> TOML 文本往返 ----------
 -- The editor never touches /tmp/vnt2cli.toml itself (that file is re-exported
--- from UCI on every start). Reading serializes the UCI config to TOML text;
--- saving parses the text back into UCI and queues a worker restart.
+-- from UCI on every start). Reload reads the runtime TOML as the complete
+-- picture; saving is a partial merge: only keys present in the text are
+-- written back to UCI, every other key keeps its current value.
 
 local TOML_EDIT_STR_KEYS = {
 	subscription = true,
@@ -800,45 +803,49 @@ local function toml_apply_to_uci(values)
 		return nil, "tunnel_addr 与 tunnel_port 互斥，不能同时填写"
 	end
 
+	-- Partial merge: only keys present in the text are written; keys absent
+	-- from the text keep their current UCI values.
+	local applied = 0
 	for _, key in ipairs(TOML_EDIT_KEY_ORDER) do
 		local value = values[key]
-		if value == nil then
-			uci:delete("vnt2", section, key)
-		elseif TOML_EDIT_BOOL_KEYS[key] then
-			uci:set("vnt2", section, key, value == true and "1" or "0")
-		elseif TOML_EDIT_NUM_KEYS[key] then
-			uci:set("vnt2", section, key, tostring(value))
-		elseif TOML_EDIT_LIST_KEYS[key] then
-			local items = {}
-			if type(value) == "table" then
-				for _, item in ipairs(value) do
-					item = trim(tostring(item))
+		if value ~= nil then
+			applied = applied + 1
+			if TOML_EDIT_BOOL_KEYS[key] then
+				uci:set("vnt2", section, key, value == true and "1" or "0")
+			elseif TOML_EDIT_NUM_KEYS[key] then
+				uci:set("vnt2", section, key, tostring(value))
+			elseif TOML_EDIT_LIST_KEYS[key] then
+				local items = {}
+				if type(value) == "table" then
+					for _, item in ipairs(value) do
+						item = trim(tostring(item))
+						if item ~= "" then
+							items[#items + 1] = item
+						end
+					end
+				else
+					local item = trim(tostring(value))
 					if item ~= "" then
 						items[#items + 1] = item
 					end
 				end
-			else
-				local item = trim(tostring(value))
-				if item ~= "" then
-					items[#items + 1] = item
-				end
-			end
-			uci:delete("vnt2", section, key)
-			if #items > 0 then
-				uci:set_list("vnt2", section, key, items)
-			end
-		else
-			local s = trim(tostring(value))
-			if s == "" then
 				uci:delete("vnt2", section, key)
+				if #items > 0 then
+					uci:set_list("vnt2", section, key, items)
+				end
 			else
-				uci:set("vnt2", section, key, s)
+				local s = trim(tostring(value))
+				if s == "" then
+					uci:delete("vnt2", section, key)
+				else
+					uci:set("vnt2", section, key, s)
+				end
 			end
 		end
 	end
 
 	uci:commit("vnt2")
-	return true
+	return true, applied
 end
 
 local function queue_restart()
@@ -864,10 +871,23 @@ local function config_audit(message)
 end
 
 function act_toml_read()
-	json_write({
-		ok = true,
+	-- Reload prefers the runtime TOML: the complete config the client
+	-- actually loaded. Fall back to a UCI serialization when the file has
+	-- not been generated yet (client never started).
+	local content = nil
+	local source = "uci"
+	if fs.access(RUNTIME_TOML_FILE) then
+		local stat = fs.stat(RUNTIME_TOML_FILE)
+		if stat and stat.type == "reg" and (tonumber(stat.size) or 0) > 0 then
+			content = textutil.sanitize_text(fs.readfile(RUNTIME_TOML_FILE) or "")
+			source = "file"
+		end
+	end
+	if content == nil or content == "" then
 		content = textutil.sanitize_text(toml_serialize_uci())
-	})
+	end
+
+	json_write({ ok = true, content = content, source = source })
 end
 
 function act_toml_save()
@@ -888,38 +908,16 @@ function act_toml_save()
 		return
 	end
 
-	-- The text is authoritative: omitted keys are cleared. Warn when keys that
-	-- currently hold values are about to be removed by this save.
-	local cleared = {}
-	local section = uci:get_first("vnt2", "vnt2_cli")
-	if section then
-		for _, key in ipairs(TOML_EDIT_KEY_ORDER) do
-			local current = uci:get("vnt2", section, key)
-			local has_value = false
-			if type(current) == "table" then
-				has_value = #current > 0
-			elseif current ~= nil and current ~= "" then
-				has_value = true
-			end
-			if has_value and values[key] == nil then
-				cleared[#cleared + 1] = key
-			end
-		end
-	end
-
-	local ok, apply_err = toml_apply_to_uci(values)
+	local ok, applied_or_err = toml_apply_to_uci(values)
 	if not ok then
-		json_write({ ok = false, error = apply_err })
+		json_write({ ok = false, error = applied_or_err })
 		return
 	end
 
+	config_audit("编辑配置保存：部分合并 " .. tostring(applied_or_err) .. " 个键（其余保持不变）")
+
 	local restart_queued = queue_restart()
-	local hint = ""
-	if #cleared > 0 then
-		hint = "注意：以下键未出现在文本中，已被清除：" .. table.concat(cleared, "、") .. "。"
-		config_audit("编辑配置保存清空了以下键：" .. table.concat(cleared, "、"))
-	end
-	hint = hint .. "已保存并写回插件配置。"
+	local hint = "已保存：部分合并 " .. tostring(applied_or_err) .. " 个键，其余键保持不变。"
 	if restart_queued then
 		hint = hint .. "后台将重启客户端使配置生效。"
 	else

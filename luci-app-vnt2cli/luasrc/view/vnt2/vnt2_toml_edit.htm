@@ -43,7 +43,7 @@ local toml_save_url = dsp.build_url("admin", "vpn", "vnt2", "toml_save")
 	<div class="vnt2-toml-toolbar">
 		<input class="cbi-button cbi-button-apply" type="button" onclick="vnt2TomlSave()" value="<%:保存配置%>" />
 		<input class="cbi-button" type="button" onclick="vnt2TomlReload()" value="<%:重新加载%>" />
-		<span class="vnt2-toml-note"><%:此处以 TOML 文本展示当前配置；保存会解析文本写回插件配置（与基本设置页同源），并由后台重启客户端生效。直接修改 /tmp/vnt2cli.toml 无效。%></span>
+		<span class="vnt2-toml-note"><%:保存只更新文本中出现的键，未出现的键保持不变（删除参数请使用设置表单）；保存后写回插件配置并由后台重启客户端生效。重新加载读取运行中的 /tmp/vnt2cli.toml。%></span>
 	</div>
 	<textarea id="vnt2_toml_editor" class="cbi-input-textarea" spellcheck="false" wrap="off"><%=self:cfgvalue(section)%></textarea>
 	<div class="vnt2-toml-msg" id="vnt2_toml_msg"></div>
@@ -70,7 +70,9 @@ local toml_save_url = dsp.build_url("admin", "vpn", "vnt2", "toml_save")
 		XHR.get(readUrl, null, function(x, data) {
 			if (data && data.ok) {
 				editor().value = data.content || "";
-				setMessage("", true);
+				setMessage(data.source === "file"
+					? "已加载运行配置 /tmp/vnt2cli.toml（客户端实际加载的完整配置）"
+					: "运行配置文件尚未生成，已显示当前配置的序列化文本", true);
 			} else {
 				setMessage((data && data.error) || "读取配置失败", false);
 			}
