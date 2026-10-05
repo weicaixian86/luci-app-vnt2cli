@@ -36,6 +36,16 @@ local cbi_options = {}
 
 -- Audit trail for config mutations: when a populated list gets cleared the
 -- running log records who did it, so silent losses are diagnosable.
+local function dump_posted(value)
+	if type(value) == "table" then
+		local items = {}
+		for i, item in ipairs(value) do
+			items[i] = tostring(item)
+		end
+		return "[" .. table.concat(items, "|") .. "]"
+	end
+	return tostring(value)
+end
 local function config_audit(message)
 	local f = io.open("/tmp/vnt2-download.log", "a")
 	if f then
@@ -618,6 +628,58 @@ local function bind_list_option(option)
 	option.remove = function(self, section)
 		self.map.uci:delete(self.map.config, section, self.option)
 	end
+
+	-- Lists are built by client side widgets: the inputs only exist after
+	-- cbi.js hydration replaced the placeholder markup. An empty post is
+	-- ambiguous - the user may have removed the last item, or the widget may
+	-- never have reported its state - and writing an empty list would silently
+	-- drop the stored configuration. Only clear the list when the request
+	-- positively confirms the emptied widget:
+	--   * __empty  - set by the page script after a real item removal
+	--   * __present - rendered by server side widgets that always post
+	-- Anything else keeps the stored value and records the event in the log.
+	option.__vnt2_managed_parse = true
+	option.parse = function(self, section, novld)
+		local cbid = self:cbid(section)
+		local posted = self:formvalue(section)
+		local values = normalized_list_values(posted)
+		local emptied = (self.map:formvalue(cbid .. ".__empty") == "1")
+			or (self.map:formvalue(cbid .. ".__present") ~= nil)
+		local old = normalized_list_values(self:cfgvalue(section))
+
+		if #values == 0 and not emptied then
+			if #old > 0 then
+				config_audit("表单未提交 " .. tostring(self.option)
+					.. " 的有效取值（posted=" .. dump_posted(posted) .. "），已保留原有 "
+					.. #old .. " 项")
+			end
+			return nil
+		end
+
+		local result = values
+		if type(self.validate) == "function" then
+			local err
+			result, err = self:validate(values, section)
+			if not result and not novld then
+				self:add_error(section, "invalid", err)
+				return nil
+			end
+		end
+
+		result = normalized_list_values(result)
+		if #result > 0 then
+			if self:write(section, result) then
+				self.section.changed = true
+			end
+		else
+			if #old > 0 then
+				config_audit("用户清空了 " .. tostring(self.option) .. "（原有 " .. #old .. " 项）")
+			end
+			if self:remove(section) then
+				self.section.changed = true
+			end
+		end
+	end
 end
 
 local function bind_dynamiclist(option)
@@ -635,15 +697,16 @@ end
 -- that races hydration (or follows a hydration error) carries no values at all
 -- and would silently wipe the stored configuration. Treat "widget absent from
 -- this request" as "keep the stored value"; a widget that is present but empty
--- still clears its field, and list widgets post a persistent empty marker so
--- clearing a hydrated list stays possible.
+-- still clears its field. List options carry their own parse that additionally
+-- requires a positive "emptied" signal before dropping stored values.
 local function keep_absent_options(section)
 	local flag_prefix = FEXIST_PREFIX or "cbi.cbe."
 	local flag_parse = Flag and Flag.parse or nil
 
 	for _, opt in ipairs(section.children) do
 		local name = opt.option
-		if name and name ~= "upload_cli" and name ~= "_toml_edit" and name ~= "_upload_note_cli" then
+		if name and not opt.__vnt2_managed_parse
+			and name ~= "upload_cli" and name ~= "_toml_edit" and name ~= "_upload_note_cli" then
 			-- Flags carry their own parse (existence marker based); every other
 			-- widget inherits AbstractValue.parse.
 			local is_flag = opt.template == "cbi/fvalue"

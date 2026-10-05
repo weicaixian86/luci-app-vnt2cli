@@ -1,11 +1,17 @@
 <%+cbi/valueheader%>
 <%
--- Presence marker: always posted, even after client-side hydration replaced
--- the widget markup below. It lets the model tell "the user cleared the list"
--- (marker alone) apart from "this widget never took part in the request"
--- (nothing posted at all), which is what keeps a race with cbi.js hydration
--- from wiping stored values.
-%><input type="hidden" name="<%=cbid%>" value="" />
+-- Clearing guard for dynamic lists.
+--
+-- The widget below only exists as a data-ui-widget placeholder until cbi.js
+-- hydrates it; the real inputs are created client side. An empty post
+-- therefore has two very different meanings:
+--   * the user removed the last item  -> the list must be cleared
+--   * the widget never reported back  -> the stored list must survive
+--
+-- The hidden __empty input carries the client's explicit "the last item was
+-- removed" signal; it is only set once a cbi-dynlist-change event was seen,
+-- so a widget that hydrates empty on its own can never wipe the stored list.
+%><div class="vnt2-dynlist" data-cbid="<%=cbid%>"><input type="hidden" data-vnt2-empty name="<%=cbid%>.__empty" value="" />
 <div<%=attr("data-ui-widget", luci.util.serialize_json({
 	"DynamicList", self:cfgvalue(section) or self.default, self:choices(), {
 		name = cbid,
@@ -30,4 +36,61 @@ if type(_vals) == "table" then
 	end
 end
 %></div>
+</div>
+<script type="text/javascript">(function() {
+	if (window.vnt2DynlistGuard) {
+		window.vnt2DynlistSync();
+		return;
+	}
+	window.vnt2DynlistGuard = true;
+
+	function host_of(node) {
+		while (node && node.nodeType === 1) {
+			if (node.classList && node.classList.contains('vnt2-dynlist')) {
+				return node;
+			}
+			node = node.parentNode;
+		}
+		return null;
+	}
+
+	function mark(host) {
+		if (!host) {
+			return;
+		}
+		var flag = host.querySelector('input[data-vnt2-empty]');
+		if (!flag) {
+			return;
+		}
+		var widget = host.querySelector('.cbi-dynlist');
+		if (!widget || host.getAttribute('data-touched') !== '1') {
+			// Not hydrated yet, or the user never touched this list: an empty
+			// post means "state unknown", never "delete everything".
+			flag.value = '';
+			return;
+		}
+		flag.value = (widget.querySelectorAll('.item').length === 0) ? '1' : '';
+	}
+
+	window.vnt2DynlistSync = function() {
+		var hosts = document.querySelectorAll('.vnt2-dynlist'), i;
+		for (i = 0; i < hosts.length; i++) {
+			mark(hosts[i]);
+		}
+	};
+
+	document.addEventListener('cbi-dynlist-change', function(ev) {
+		var host = host_of(ev.target);
+		if (!host) {
+			return;
+		}
+		host.setAttribute('data-touched', '1');
+		mark(host);
+	});
+
+	document.addEventListener('submit', window.vnt2DynlistSync, true);
+	window.addEventListener('load', window.vnt2DynlistSync);
+	window.setTimeout(window.vnt2DynlistSync, 2000);
+	window.vnt2DynlistSync();
+})();</script>
 <%+cbi/valuefooter%>

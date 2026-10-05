@@ -8,10 +8,13 @@ for value in util.imatch(self:cfgvalue(section) or self.default) do
 end
 %>
 <%
--- Presence marker: always posted, even after client-side hydration replaced
--- the widget markup below, so the model can tell "the user cleared every
--- direction" apart from "this widget never took part in the request".
-%><input type="hidden" name="<%=cbid%>" value="" />
+-- Presence marker rendered outside the widget placeholder: hydration replaces
+-- the placeholder below, this marker survives it. Together with the fallback
+-- inputs inside the placeholder it separates "the user unchecked every
+-- direction" (marker posted, no values) from "the widget never took part in
+-- the request" (nothing posted at all), which would otherwise wipe the stored
+-- selection.
+%><input type="hidden" name="<%=cbid%>.__present" value="1" />
 <div<%=attr("data-ui-widget", luci.util.serialize_json({
 	"Select", values, self:choices(), {
 		id = cbid,
