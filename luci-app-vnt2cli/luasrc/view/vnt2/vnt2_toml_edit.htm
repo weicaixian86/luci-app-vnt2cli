@@ -87,7 +87,13 @@ local toml_save_url = dsp.build_url("admin", "vpn", "vnt2", "toml_save")
 		}
 		XHR.post(saveUrl, { content: content }, function(x, data) {
 			if (data && data.ok) {
-				setMessage(data.hint || "已保存。", true);
+				setMessage((data.hint || "已保存。") + " 页面即将刷新以同步表单取值…", true);
+				// The rest of the form still holds the values rendered before
+				// this editor save. Reload so a later form submit cannot write
+				// those stale values back over the edited config.
+				window.setTimeout(function() {
+					window.location.reload();
+				}, 1500);
 			} else {
 				setMessage((data && data.error) || "保存失败", false);
 			}
