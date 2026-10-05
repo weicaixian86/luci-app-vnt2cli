@@ -2,7 +2,6 @@ local http = require "luci.http"
 local fs = require "nixio.fs"
 local nixio = require "nixio"
 local util = require "luci.util"
-local uci = require "luci.model.uci".cursor()
 local textutil = require "luci.model.vnt2_text"
 
 local UPLOAD_DIR = "/etc/vnt2/upload"
@@ -54,6 +53,9 @@ local function config_audit(message)
 		f:close()
 	end
 end
+
+-- Cheap deterministic fingerprint of a blob of text, exported by vnt2_text so
+-- templates can stamp the text they render.
 
 
 local function add_file_upload_handler(note_options)
@@ -197,6 +199,18 @@ local function normalized_list_values(value)
 	end
 
 	return result
+end
+
+local function same_list(a, b)
+	if #a ~= #b then
+		return false
+	end
+	for i = 1, #a do
+		if a[i] ~= b[i] then
+			return false
+		end
+	end
+	return true
 end
 
 local function validate_server_item(value, allow_udp)
@@ -625,14 +639,11 @@ local function bind_list_option(option)
 
 	option.write = function(self, section, value)
 		local values = normalized_list_values(value)
-		local old = normalized_list_values(self:cfgvalue(section))
-		if #old > 0 and #values == 0 then
-			config_audit("表单保存清空了 " .. tostring(self.option) .. "（原有 " .. #old .. " 项）")
-		end
 		self.map.uci:delete(self.map.config, section, self.option)
 		if #values > 0 then
 			self.map.uci:set_list(self.map.config, section, self.option, values)
 		end
+		return true
 	end
 
 	option.remove = function(self, section)
@@ -640,30 +651,43 @@ local function bind_list_option(option)
 	end
 
 	-- Lists are built by client side widgets: the inputs only exist after
-	-- cbi.js hydration replaced the placeholder markup. An empty post is
+	-- cbi.js hydration replaced the placeholder markup, and the stored values
+	-- are mirrored into <cbid>.__stored inputs rendered outside that
+	-- placeholder so hydration can never remove them. An empty post is
 	-- ambiguous - the user may have removed the last item, or the widget may
 	-- never have reported its state - and writing an empty list would silently
 	-- drop the stored configuration. Only clear the list when the request
 	-- positively confirms the emptied widget:
-	--   * __empty  - set by the page script after a real item removal
+	--   * __empty   - set by the page script after a real item removal
 	--   * __present - rendered by server side widgets that always post
-	-- Anything else keeps the stored value and records the event in the log.
+	-- Anything else keeps whatever __stored says was configured when the page
+	-- was rendered, and records the decision in the log.
 	option.__vnt2_managed_parse = true
 	option.parse = function(self, section, novld)
 		local cbid = self:cbid(section)
 		local posted = self:formvalue(section)
 		local values = normalized_list_values(posted)
+		local stored = normalized_list_values(self.map:formvalue(cbid .. ".__stored"))
 		local emptied = (self.map:formvalue(cbid .. ".__empty") == "1")
 			or (self.map:formvalue(cbid .. ".__present") ~= nil)
-		local old = normalized_list_values(self:cfgvalue(section))
 
-		if #values == 0 and not emptied then
-			if #old > 0 then
+		if #values == 0 then
+			if emptied then
+				if #stored > 0 then
+					config_audit("用户清空了 " .. tostring(self.option) .. "（原有 "
+						.. #stored .. " 项）")
+				end
+			elseif #stored > 0 then
+				-- The widget reported nothing and the browser never confirmed
+				-- a removal: keep what the page rendered. Writing the stored
+				-- values back is unnecessary, UCI already holds them.
 				config_audit("表单未提交 " .. tostring(self.option)
-					.. " 的有效取值（posted=" .. dump_posted(posted) .. "），已保留原有 "
-					.. #old .. " 项")
+					.. " 的取值（posted=" .. dump_posted(posted)
+					.. "，stored=" .. #stored .. "），已保留原有 " .. #stored .. " 项")
+				return nil
+			else
+				return nil
 			end
-			return nil
 		end
 
 		local result = values
@@ -677,17 +701,19 @@ local function bind_list_option(option)
 		end
 
 		result = normalized_list_values(result)
+		-- Idempotent: only touch UCI when the parsed list really differs from
+		-- what is stored now, so saving an unchanged form neither rewrites the
+		-- config nor marks the page as changed (which would queue a restart).
+		local current = normalized_list_values(
+			self.map.uci:get(self.map.config, section, self.option))
 		if #result > 0 then
-			if self:write(section, result) then
+			if not same_list(current, result) then
+				self:write(section, result)
 				self.section.changed = true
 			end
-		else
-			if #old > 0 then
-				config_audit("用户清空了 " .. tostring(self.option) .. "（原有 " .. #old .. " 项）")
-			end
-			if self:remove(section) then
-				self.section.changed = true
-			end
+		elseif #current > 0 then
+			self:remove(section)
+			self.section.changed = true
 		end
 	end
 end
@@ -1110,10 +1136,21 @@ m.on_parse = function()
 	end
 	content = tostring(content or ""):gsub("%z", "")
 
-	if http.formvalue("_toml_editor_text_dirty") ~= "1" then
+	if trim(content) == "" then
 		return
 	end
-	if trim(content) == "" or content == textutil.toml_serialize_uci(uci) then
+
+	-- The merge must run on the map's own cursor and must not commit early:
+	-- a second cursor would write a delta the map's later commit overwrites,
+	-- which is why the edited text silently vanished on save & apply.
+	local rendered = http.formvalue("_toml_editor_text_fingerprint")
+	if rendered ~= nil and textutil.text_fingerprint(content) == tostring(rendered) then
+		return
+	end
+
+	if http.formvalue("_toml_editor_text_dirty") ~= "1" then
+		config_audit("编辑配置随表单保存：文本与页面渲染内容不同但未标记为已编辑"
+			.. "（长度 " .. #content .. "），按运行时快照处理，未写入")
 		return
 	end
 
@@ -1123,7 +1160,7 @@ m.on_parse = function()
 		return
 	end
 
-	local ok, applied = textutil.toml_apply_to_uci(uci, values)
+	local ok, applied = textutil.toml_apply_to_uci(m.uci, values, false)
 	if not ok then
 		config_audit("编辑配置随表单保存失败：" .. tostring(applied))
 		return
@@ -1131,6 +1168,8 @@ m.on_parse = function()
 	if applied > 0 then
 		config_audit("编辑配置随表单保存：部分合并 " .. tostring(applied)
 			.. " 个键（其余保持不变）")
+	else
+		config_audit("编辑配置随表单保存：文本无实际变化，未写入")
 	end
 end
 

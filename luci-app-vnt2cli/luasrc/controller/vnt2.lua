@@ -593,7 +593,7 @@ function act_toml_save()
 		return
 	end
 
-	local ok, applied_or_err = textutil.toml_apply_to_uci(uci, values)
+	local ok, applied_or_err = textutil.toml_apply_to_uci(uci, values, true)
 	if not ok then
 		json_write({ ok = false, error = applied_or_err })
 		return

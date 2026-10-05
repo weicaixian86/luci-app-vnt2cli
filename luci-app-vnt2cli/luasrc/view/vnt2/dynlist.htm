@@ -11,8 +11,20 @@
 -- The hidden __empty input carries the client's explicit "the last item was
 -- removed" signal; it is only set once a cbi-dynlist-change event was seen,
 -- so a widget that hydrates empty on its own can never wipe the stored list.
-%><div class="vnt2-dynlist" data-cbid="<%=cbid%>"><input type="hidden" data-vnt2-empty name="<%=cbid%>.__empty" value="" />
-<div<%=attr("data-ui-widget", luci.util.serialize_json({
+%><div class="vnt2-dynlist" data-cbid="<%=cbid%>"><input type="hidden" data-vnt2-empty name="<%=cbid%>.__empty" value="" /><%
+-- Stored mirror: these inputs live OUTSIDE the widget placeholder below, so
+-- cbi.js hydration (which replaces that placeholder) can never remove them.
+-- They are the server's memory of what was configured when the page was
+-- rendered, and are what a save falls back to when the widget posts nothing.
+local _vals = self:cfgvalue(section)
+if type(_vals) == "table" then
+	for _, _v in ipairs(_vals) do
+		if _v and _v ~= "" then
+%><input type="hidden" name="<%=cbid%>.__stored" value="<%=pcdata(_v)%>" /><%
+		end
+	end
+end
+%><div<%=attr("data-ui-widget", luci.util.serialize_json({
 	"DynamicList", self:cfgvalue(section) or self.default, self:choices(), {
 		name = cbid,
 		size = self.size,
@@ -22,12 +34,9 @@
 		placeholder = self.placeholder
 	}
 }))%>><%
--- Fallback inputs: when cbi.js hydration never ran for this widget (an
--- earlier hydration error, or the form was submitted before hydration
--- finished), these post the rendered values so a form save cannot silently
--- clear the list. Successful hydration replaces this whole div, removing
--- the fallbacks in favor of the widget's own inputs.
-local _vals = self:cfgvalue(section)
+-- Fallback values inside the placeholder: they post the rendered values while
+-- the widget has not been hydrated yet, which covers a submit that races
+-- hydration. Successful hydration replaces this div with the real widget.
 if type(_vals) == "table" then
 	for _, _v in ipairs(_vals) do
 		if _v and _v ~= "" then

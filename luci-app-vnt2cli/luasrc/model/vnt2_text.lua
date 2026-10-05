@@ -595,7 +595,30 @@ local function toml_list_equal(current, items)
 	return true
 end
 
-function M.toml_apply_to_uci(uci, values)
+-- Cheap deterministic fingerprint of a blob of text. The settings model uses
+-- it to tell whether the editor content a form posted is still exactly the
+-- text the page rendered - the only reliable server side way to distinguish
+-- "the user typed something" from "the pane merely shows the runtime snapshot
+-- it loaded over XHR".
+function M.text_fingerprint(text)
+	text = tostring(text or "")
+	local sum, rolling = 0, 0
+	for i = 1, #text do
+		local b = string.byte(text, i)
+		sum = (sum + b * (i % 97 + 1)) % 2147483647
+		rolling = (rolling * 31 + b) % 2147483647
+	end
+	return string.format("%d.%d.%d", #text, sum, rolling)
+end
+
+-- Partial merge: only keys present in the text are considered, and only keys
+-- whose value actually differs are written; the stored configuration is never
+-- touched by a save that changes nothing.
+--
+-- do_commit defaults to true for the standalone editor endpoint; the settings
+-- model passes false so the merge joins the form's own UCI transaction instead
+-- of being committed by a second cursor the map would overwrite afterwards.
+function M.toml_apply_to_uci(uci, values, do_commit)
 	local section = uci:get_first("vnt2", "vnt2_cli")
 	if not section then
 		return nil, "未找到 vnt2_cli 配置节"
@@ -660,22 +683,23 @@ function M.toml_apply_to_uci(uci, values)
 						items[#items + 1] = item
 					end
 				end
-				if not toml_list_equal(uci:get("vnt2", section, key), items) then
-					uci:delete("vnt2", section, key)
-					if #items > 0 then
-						uci:set_list("vnt2", section, key, items)
-					end
-					applied = applied + 1
-				end
-			else
-				local s = trim(tostring(value))
-				if s == "" then
-					local cur = uci:get("vnt2", section, key)
-					if cur ~= nil and cur ~= "" then
+				if #items > 0 then
+					-- Empty lists are never applied: the editor is documented
+					-- as "keys present in the text are merged", and removing a
+					-- parameter belongs to the settings form. A runtime
+					-- snapshot that failed to serialize a list must not delete
+					-- the stored one.
+					if not toml_list_equal(uci:get("vnt2", section, key), items) then
 						uci:delete("vnt2", section, key)
+						uci:set_list("vnt2", section, key, items)
 						applied = applied + 1
 					end
-				elseif uci:get("vnt2", section, key) ~= s then
+				end
+			else
+				-- Same reason: an empty value in the text means "not present",
+				-- not "delete this option". Deletion is the form's job.
+				local s = trim(tostring(value))
+				if s ~= "" and uci:get("vnt2", section, key) ~= s then
 					uci:set("vnt2", section, key, s)
 					applied = applied + 1
 				end
@@ -683,7 +707,7 @@ function M.toml_apply_to_uci(uci, values)
 		end
 	end
 
-	if applied > 0 then
+	if applied > 0 and do_commit ~= false then
 		uci:commit("vnt2")
 	end
 	return true, applied

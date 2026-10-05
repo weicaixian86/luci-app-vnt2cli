@@ -14,8 +14,14 @@ end
 -- direction" (marker posted, no values) from "the widget never took part in
 -- the request" (nothing posted at all), which would otherwise wipe the stored
 -- selection.
-%><input type="hidden" name="<%=cbid%>.__present" value="1" />
-<div<%=attr("data-ui-widget", luci.util.serialize_json({
+%><input type="hidden" name="<%=cbid%>.__present" value="1" /><%
+-- Stored mirror, outside the placeholder so hydration cannot remove it.
+for _, _v in ipairs(values) do
+	if _v and _v ~= "" then
+%><input type="hidden" name="<%=cbid%>.__stored" value="<%=pcdata(_v)%>" /><%
+	end
+end
+%><div<%=attr("data-ui-widget", luci.util.serialize_json({
 	"Select", values, self:choices(), {
 		id = cbid,
 		name = cbid,
