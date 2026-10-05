@@ -42,7 +42,7 @@ local list_options = {}
 -- Bumped whenever the save path changes. Every form save logs it, so a report
 -- can be matched against the code that produced it instead of guessing which
 -- build the device is running.
-local FORM_BUILD = "2026-10-05.8"
+local FORM_BUILD = "2026-10-05.9"
 
 -- Audit trail for config mutations: when a populated list gets cleared the
 -- running log records who did it, so silent losses are diagnosable.
@@ -1329,9 +1329,19 @@ m.on_parse = function()
 		return
 	end
 
-	if http.formvalue("_toml_editor_text_dirty") ~= "1" then
-		config_audit("编辑配置随表单保存：文本与页面渲染内容不同但未标记为已编辑"
-			.. "（长度 " .. #content .. "），按运行时快照处理，未写入")
+	-- The JS dirty flag is set on input/change, but LuCI's cbi_submit()
+	-- calls form.submit() directly and that does NOT dispatch a submit event,
+	-- so the capture-phase syncDirty() may be missed. The original purpose of
+	-- the flag was to avoid overwriting stored config with a runtime snapshot
+	-- loaded by "重新加载". We achieve the same protection server-side by
+	-- comparing the posted text against the current runtime snapshot.
+	local snapshot = ""
+	local stat = fs.stat("/tmp/vnt2cli.toml")
+	if stat and stat.type == "reg" and (tonumber(stat.size) or 0) > 0 then
+		snapshot = textutil.sanitize_text(fs.readfile("/tmp/vnt2cli.toml") or "")
+	end
+	if snapshot ~= "" and textutil.text_fingerprint(content) == textutil.text_fingerprint(snapshot) then
+		config_audit("编辑配置随表单保存：文本与运行时快照一致（未编辑），未写入")
 		return
 	end
 
