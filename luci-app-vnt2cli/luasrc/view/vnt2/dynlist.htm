@@ -1,0 +1,26 @@
+<%+cbi/valueheader%>
+<div<%=attr("data-ui-widget", luci.util.serialize_json({
+	"DynamicList", self:cfgvalue(section) or self.default, self:choices(), {
+		name = cbid,
+		size = self.size,
+		sort = self.keylist,
+		datatype = self.datatype,
+		optional = self.optional or self.rmempty,
+		placeholder = self.placeholder
+	}
+}))%>><%
+-- Fallback inputs: when cbi.js hydration never ran for this widget (an
+-- earlier hydration error, or the form was submitted before hydration
+-- finished), these post the rendered values so a form save cannot silently
+-- clear the list. Successful hydration replaces this whole div, removing
+-- the fallbacks in favor of the widget's own inputs.
+local _vals = self:cfgvalue(section)
+if type(_vals) == "table" then
+	for _, _v in ipairs(_vals) do
+		if _v and _v ~= "" then
+%><input type="hidden" name="<%=cbid%>" value="<%=pcdata(_v)%>" /><%
+		end
+	end
+end
+%></div>
+<%+cbi/valuefooter%>

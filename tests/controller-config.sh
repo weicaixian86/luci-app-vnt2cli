@@ -88,6 +88,9 @@ assert_contains "$CTRL" 'tunnel_addr 与 tunnel_port 互斥' "editor enforces tu
 assert_contains "$MODEL" 'w:tab("edit", translate("编辑配置"))' "edit config tab registered"
 assert_contains "$MODEL" 'vnt2/vnt2_toml_edit' "edit tab renders the editor template"
 assert_contains "$MODEL" 'vnt2/vnt2_form_css' "form css compaction template attached"
+assert_contains "$MODEL" 'vnt2/dynlist' "dynamic lists use the fallback-values template"
+assert_contains "${PKG_DIR}/luasrc/view/vnt2/dynlist.htm" 'input type="hidden"' "dynlist fallback inputs render current values"
+assert_contains "$MODEL" 'bind_list_option(vnt2_forward)' "forwarding multi-value keeps its own template"
 assert_contains "$MODEL" 'w:tab("upload", translate("上传程序"))' "upload tab still registered"
 if [ -f "${PKG_DIR}/luasrc/view/vnt2/vnt2_toml_edit.htm" ]; then
 	checks=$((checks + 1))

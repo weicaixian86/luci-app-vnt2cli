@@ -593,7 +593,7 @@ local function current_option(self, option)
 	return trim(value)
 end
 
-local function bind_dynamiclist(option)
+local function bind_list_option(option)
 	option.cfgvalue = function(self, section)
 		local value = AbstractValue.cfgvalue(self, section)
 		local result = normalized_list_values(value)
@@ -618,6 +618,14 @@ local function bind_dynamiclist(option)
 	option.remove = function(self, section)
 		self.map.uci:delete(self.map.config, section, self.option)
 	end
+end
+
+local function bind_dynamiclist(option)
+	bind_list_option(option)
+	-- Custom template: renders the current values as fallback hidden inputs
+	-- inside the data-ui-widget div, so a form save cannot clear the list
+	-- when cbi.js hydration never ran for the widget.
+	option.template = "vnt2/dynlist"
 end
 
 local function bind_download_mirror(option)
@@ -896,7 +904,7 @@ vnt2_forward:value("vnt2fwwan", translate("VNT2 -> WAN"))
 vnt2_forward:value("lanfwvnt2", translate("LAN -> VNT2"))
 vnt2_forward:value("wanfwvnt2", translate("WAN -> VNT2"))
 vnt2_forward.description = translate("VNT2 与 LAN/WAN 之间允许的转发方向；未选择的方向不自动放行")
-bind_dynamiclist(vnt2_forward)
+bind_list_option(vnt2_forward)
 
 local password = w:taboption("security", Value, "password", translate("加密密码"))
 password.password = true

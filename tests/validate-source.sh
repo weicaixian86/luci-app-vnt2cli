@@ -211,7 +211,8 @@ for f in \
 	"${PKG_DIR}/luasrc/model/cbi/vnt2_status.lua" \
 	"${PKG_DIR}/luasrc/view/vnt2/vnt2_status.htm" \
 	"${PKG_DIR}/luasrc/view/vnt2/vnt2_toml_edit.htm" \
-	"${PKG_DIR}/luasrc/view/vnt2/vnt2_form_css.htm"; do
+	"${PKG_DIR}/luasrc/view/vnt2/vnt2_form_css.htm" \
+	"${PKG_DIR}/luasrc/view/vnt2/dynlist.htm"; do
 	if [ -f "$f" ]; then
 		ok
 	else
