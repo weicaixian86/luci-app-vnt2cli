@@ -2217,7 +2217,7 @@ start_cli_instance() {
 			log_service 'start failed: runtime toml export failed'
 			return 1
 		fi
-		log_service 'client disabled; runtime toml export skipped'
+		log_service 'client disabled; runtime toml export failed'
 		cleanup_network
 		return 0
 	fi

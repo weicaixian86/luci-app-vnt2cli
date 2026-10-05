@@ -54,6 +54,7 @@ local toml_save_url = dsp.build_url("admin", "vpn", "vnt2", "toml_save")
 (function() {
 	var readUrl = "<%=toml_read_url%>";
 	var saveUrl = "<%=toml_save_url%>";
+	var dirty = false;
 
 	function editor() {
 		return document.getElementById("vnt2_toml_editor");
@@ -70,6 +71,7 @@ local toml_save_url = dsp.build_url("admin", "vpn", "vnt2", "toml_save")
 		XHR.get(readUrl, null, function(x, data) {
 			if (data && data.ok) {
 				editor().value = data.content || "";
+				dirty = false;
 				setMessage(data.source === "file"
 					? "已加载运行配置 /tmp/vnt2cli.toml（客户端实际加载的完整配置）"
 					: "客户端未运行或运行配置尚未生成，已显示当前配置的序列化文本", true);
@@ -89,6 +91,7 @@ local toml_save_url = dsp.build_url("admin", "vpn", "vnt2", "toml_save")
 		}
 		XHR.post(saveUrl, { content: content }, function(x, data) {
 			if (data && data.ok) {
+				dirty = false;
 				setMessage((data.hint || "已保存。") + " 页面即将刷新以同步表单取值…", true);
 				// The rest of the form still holds the values rendered before
 				// this editor save. Reload so a later form submit cannot write
@@ -102,7 +105,36 @@ local toml_save_url = dsp.build_url("admin", "vpn", "vnt2", "toml_save")
 		});
 	};
 
-	if (editor() && editor().value.replace(/\s/g, "") === "") {
+	var node = editor();
+	if (node) {
+		node.addEventListener("input", function() {
+			dirty = true;
+		});
+
+		// Refresh the editor text whenever its tab becomes visible, unless the
+		// user has unsaved edits. Without this the pane keeps the snapshot taken
+		// at page render and a later save would write that stale text back over
+		// newer form changes.
+		var pane = document.querySelector('.cbi-tabcontainer[data-tab="edit"]');
+		if (pane && pane.addEventListener) {
+			pane.addEventListener("cbi-tab-active", function() {
+				if (!dirty) {
+					reload();
+				}
+			});
+		}
+	}
+
+	// A back/forward cache restore brings back the DOM of an older render - both
+	// the form fields and this editor would then hold pre-save values that a
+	// later save writes over the current configuration. Reload such restores.
+	window.addEventListener("pageshow", function(ev) {
+		if (ev && ev.persisted) {
+			window.location.reload();
+		}
+	});
+
+	if (node && node.value.replace(/\s/g, "") === "") {
 		reload();
 	}
 })();

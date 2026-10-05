@@ -1,4 +1,11 @@
 <%+cbi/valueheader%>
+<%
+-- Presence marker: always posted, even after client-side hydration replaced
+-- the widget markup below. It lets the model tell "the user cleared the list"
+-- (marker alone) apart from "this widget never took part in the request"
+-- (nothing posted at all), which is what keeps a race with cbi.js hydration
+-- from wiping stored values.
+%><input type="hidden" name="<%=cbid%>" value="" />
 <div<%=attr("data-ui-widget", luci.util.serialize_json({
 	"DynamicList", self:cfgvalue(section) or self.default, self:choices(), {
 		name = cbid,

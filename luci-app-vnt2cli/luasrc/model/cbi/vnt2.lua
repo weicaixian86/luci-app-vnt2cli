@@ -628,6 +628,45 @@ local function bind_dynamiclist(option)
 	option.template = "vnt2/dynlist"
 end
 
+-- LuCI deletes an option whenever its widget contributed no value to the
+-- request: AbstractValue.parse removes rmempty/optional fields without a form
+-- value and Flag.parse removes flags that lack the cbi.cbe existence marker.
+-- Every widget on this page is hydrated asynchronously by cbi.js, so a submit
+-- that races hydration (or follows a hydration error) carries no values at all
+-- and would silently wipe the stored configuration. Treat "widget absent from
+-- this request" as "keep the stored value"; a widget that is present but empty
+-- still clears its field, and list widgets post a persistent empty marker so
+-- clearing a hydrated list stays possible.
+local function keep_absent_options(section)
+	local flag_prefix = FEXIST_PREFIX or "cbi.cbe."
+	local flag_parse = Flag and Flag.parse or nil
+
+	for _, opt in ipairs(section.children) do
+		local name = opt.option
+		if name and name ~= "upload_cli" and name ~= "_toml_edit" and name ~= "_upload_note_cli" then
+			-- Flags carry their own parse (existence marker based); every other
+			-- widget inherits AbstractValue.parse.
+			local is_flag = opt.template == "cbi/fvalue"
+			local base = (is_flag and flag_parse) or AbstractValue.parse
+
+			opt.parse = function(self, sect, novld)
+				-- A widget took part in this request when it posted its value or
+				-- (for flags, which post nothing while unchecked) its existence
+				-- marker. Anything else never reached the browser form.
+				local present = self:formvalue(sect) ~= nil
+				if not present then
+					present = self.map:formvalue(flag_prefix .. self.map.config
+						.. "." .. tostring(sect) .. "." .. self.option) ~= nil
+				end
+				if not present then
+					return nil
+				end
+				return base(self, sect, novld)
+			end
+		end
+	end
+end
+
 local function bind_download_mirror(option)
 	option:value("auto", translate("自动"))
 	option:value("gh-proxy", "gh-proxy")
@@ -905,6 +944,38 @@ vnt2_forward:value("lanfwvnt2", translate("LAN -> VNT2"))
 vnt2_forward:value("wanfwvnt2", translate("WAN -> VNT2"))
 vnt2_forward.description = translate("VNT2 与 LAN/WAN 之间允许的转发方向；未选择的方向不自动放行")
 bind_list_option(vnt2_forward)
+-- MultiValue.validate joins the selection into one delimiter-separated string,
+-- which bind_list_option would store as a single list item containing spaces.
+-- Keep the managed firewall directions a real UCI list instead.
+vnt2_forward.template = "vnt2/multilist"
+vnt2_forward.validate = function(self, value)
+	local choices = {}
+	for _, key in ipairs(self.keylist or {}) do
+		choices[key] = true
+	end
+
+	local selected = {}
+	local function add(item)
+		item = trim(item)
+		if item ~= "" and choices[item] and not util.contains(selected, item) then
+			selected[#selected + 1] = item
+		end
+	end
+
+	if type(value) == "table" then
+		for _, item in ipairs(value) do
+			for part in tostring(item):gmatch("%S+") do
+				add(part)
+			end
+		end
+	elseif value ~= nil then
+		for part in tostring(value):gmatch("%S+") do
+			add(part)
+		end
+	end
+
+	return selected
+end
 
 local password = w:taboption("security", Value, "password", translate("加密密码"))
 password.password = true
@@ -946,6 +1017,8 @@ local cli_upload_note = w:taboption("upload", DummyValue, "_upload_note_cli")
 cli_upload_note.rawhtml = true
 cli_upload_note.template = "vnt2/other_dvalue"
 cbi_options.cli_upload_note = cli_upload_note
+
+keep_absent_options(w)
 end)()
 
 

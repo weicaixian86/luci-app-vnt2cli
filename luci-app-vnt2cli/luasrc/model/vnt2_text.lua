@@ -41,6 +41,7 @@ end
 local log_message_exact_map = {
 	["start failed: missing executable vnt2_cli"] = "启动失败：缺少可执行文件 vnt2_cli",
 	["start failed: runtime toml export failed"] = "启动失败：运行配置导出失败",
+	["client disabled; runtime toml export failed"] = "客户端已停用；运行配置导出失败，保留原运行配置文件",
 	["export failed: client config missing network_code and subscription"] = "导出失败：客户端配置缺少 network_code 和 subscription",
 	["export failed: tunnel_addr and tunnel_port are mutually exclusive"] = "导出失败：tunnel_addr 与 tunnel_port 互斥，不能同时填写",
 	["export failed: unable to publish runtime toml"] = "导出失败：无法写入运行配置文件",

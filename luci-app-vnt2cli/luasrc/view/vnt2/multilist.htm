@@ -1,0 +1,37 @@
+<%+cbi/valueheader%>
+<%
+local util = require "luci.util"
+local values = {}
+local value
+for value in util.imatch(self:cfgvalue(section) or self.default) do
+	values[#values+1] = value
+end
+%>
+<%
+-- Presence marker: always posted, even after client-side hydration replaced
+-- the widget markup below, so the model can tell "the user cleared every
+-- direction" apart from "this widget never took part in the request".
+%><input type="hidden" name="<%=cbid%>" value="" />
+<div<%=attr("data-ui-widget", luci.util.serialize_json({
+	"Select", values, self:choices(), {
+		id = cbid,
+		name = cbid,
+		size = self.size,
+		sort = self.keylist,
+		multiple = true,
+		widget = self.widget,
+		datatype = self.datatype,
+		optional = self.optional or self.rmempty,
+		readonly = self.readonly,
+		placeholder = self.placeholder
+	}
+}))%>><%
+-- Fallback inputs: when cbi.js hydration never ran for this widget, these post
+-- the rendered values so a form save cannot silently clear the selection.
+for _, _v in ipairs(values) do
+	if _v and _v ~= "" then
+%><input type="hidden" name="<%=cbid%>" value="<%=pcdata(_v)%>" /><%
+	end
+end
+%></div>
+<%+cbi/valuefooter%>

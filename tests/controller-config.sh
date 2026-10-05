@@ -90,6 +90,13 @@ assert_contains "$MODEL" 'vnt2/vnt2_toml_edit' "edit tab renders the editor temp
 assert_contains "$MODEL" 'vnt2/vnt2_form_css' "form css compaction template attached"
 assert_contains "$MODEL" 'vnt2/dynlist' "dynamic lists use the fallback-values template"
 assert_contains "${PKG_DIR}/luasrc/view/vnt2/dynlist.htm" 'input type="hidden"' "dynlist fallback inputs render current values"
+assert_contains "${PKG_DIR}/luasrc/view/vnt2/dynlist.htm" 'name="<%=cbid%>" value=""' "dynlist posts an always-present presence marker"
+assert_contains "${PKG_DIR}/luasrc/view/vnt2/multilist.htm" 'input type="hidden"' "multi value template renders fallback inputs and marker"
+assert_contains "$MODEL" 'vnt2/multilist' "firewall directions use the list-safe template"
+assert_contains "$MODEL" 'keep_absent_options(w)' "form keeps stored values when a widget is absent from the request"
+assert_contains "$MODEL" 'FEXIST_PREFIX or "cbi.cbe."' "flag widgets are guarded by their existence marker"
+assert_contains "$MODEL" 'return base(self, sect, novld)' "guarded widgets still run the stock parse when present"
+assert_contains "$MODEL" 'vnt2_forward.validate = function(self, value)' "firewall directions keep list semantics on save"
 assert_contains "$MODEL" 'bind_list_option(vnt2_forward)' "forwarding multi-value keeps its own template"
 assert_contains "$MODEL" 'w:tab("upload", translate("上传程序"))' "upload tab still registered"
 if [ -f "${PKG_DIR}/luasrc/view/vnt2/vnt2_toml_edit.htm" ]; then
@@ -108,6 +115,8 @@ else
 fi
 assert_contains "${PKG_DIR}/luasrc/view/vnt2/vnt2_toml_edit.htm" 'toml_save' "editor template posts to save endpoint"
 assert_contains "${PKG_DIR}/luasrc/view/vnt2/vnt2_toml_edit.htm" 'vnt2TomlReload' "editor template offers reload"
+assert_contains "${PKG_DIR}/luasrc/view/vnt2/vnt2_toml_edit.htm" 'cbi-tab-active' "editor reloads when its tab is activated"
+assert_contains "${PKG_DIR}/luasrc/view/vnt2/vnt2_toml_edit.htm" 'pageshow' "stale back/forward cache restores trigger a reload"
 
 # --- logs ---
 assert_contains "$CTRL" '/tmp/logs/vnt2.log' "client log path"
