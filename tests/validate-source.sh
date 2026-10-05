@@ -197,6 +197,19 @@ for f in "${INIT}" "${PKG_DIR}/root/usr/libexec/vnt2/upload-worker"; do
 	fi
 done
 
+# ---------- LuCI template syntax ----------
+# The Lua template engine only understands <% %>, <%= %>, <%: %> and <%+ %>.
+# Anything else between the brackets is handed to Lua verbatim, so an
+# HTML-looking <%-- comment --%> is a syntax error that takes down the whole
+# settings page. Comments must be plain HTML.
+for f in $(find "${PKG_DIR}/luasrc" -type f -name '*.htm' 2>/dev/null); do
+	if grep -q '<%--\|--%>' "$f"; then
+		fail "invalid template comment in $f: use <!-- --> instead of <%-- --%>"
+	else
+		ok
+	fi
+done
+
 # ---------- required files ----------
 for f in \
 	"${PKG_DIR}/root/etc/init.d/vnt2" \
@@ -212,7 +225,10 @@ for f in \
 	"${PKG_DIR}/luasrc/view/vnt2/vnt2_status.htm" \
 	"${PKG_DIR}/luasrc/view/vnt2/vnt2_toml_edit.htm" \
 	"${PKG_DIR}/luasrc/view/vnt2/vnt2_form_css.htm" \
-	"${PKG_DIR}/luasrc/view/vnt2/dynlist.htm"; do
+	"${PKG_DIR}/luasrc/view/vnt2/dynlist.htm" \
+	"${PKG_DIR}/luasrc/view/vnt2/multilist.htm" \
+	"${PKG_DIR}/luasrc/view/vnt2/other_dvalue.htm" \
+	"${PKG_DIR}/luasrc/view/vnt2/other_upload.htm"; do
 	if [ -f "$f" ]; then
 		ok
 	else
