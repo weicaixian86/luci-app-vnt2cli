@@ -34,6 +34,11 @@ end
 -- CBI validators may need values from sibling fields in the same form post.
 local cbi_options = {}
 
+-- Bumped whenever the save path changes. Every form save logs it, so a report
+-- can be matched against the code that produced it instead of guessing which
+-- build the device is running.
+local FORM_BUILD = "2026-10-05.4"
+
 -- Audit trail for config mutations: when a populated list gets cleared the
 -- running log records who did it, so silent losses are diagnosable.
 local function dump_posted(value)
@@ -45,6 +50,22 @@ local function dump_posted(value)
 		return "[" .. table.concat(items, "|") .. "]"
 	end
 	return tostring(value)
+end
+
+-- Diagnostic: every key of this request that belongs to one widget. Knowing
+-- which of <cbid>, <cbid>.__stored, <cbid>.__empty and <cbid>.__diag actually
+-- arrived tells whether the browser hydrated the widget, which is impossible
+-- to infer on the server side alone.
+local function dump_post_keys(map, prefix)
+	local keys = {}
+	local ok, values = pcall(map.formvaluetable, map, prefix)
+	if ok and type(values) == "table" then
+		for key in pairs(values) do
+			keys[#keys + 1] = tostring(key)
+		end
+	end
+	table.sort(keys)
+	return "{" .. table.concat(keys, ",") .. "}"
 end
 local function config_audit(message)
 	local f = io.open("/tmp/vnt2-download.log", "a")
@@ -671,11 +692,21 @@ local function bind_list_option(option)
 		local emptied = (self.map:formvalue(cbid .. ".__empty") == "1")
 			or (self.map:formvalue(cbid .. ".__present") ~= nil)
 
+		-- Diagnostic from the page script: h=hydrated, i=item count, s=the
+		-- widget was seen with at least one item. When the browser reported it,
+		-- only believe a clear request from a widget that really displayed the
+		-- stored items - a widget that never showed an item cannot have had it
+		-- removed by the user.
+		local diag = tostring(self.map:formvalue(cbid .. ".__diag") or "-")
+		if emptied and diag ~= "-" then
+			emptied = diag:find("s=1", 1, true) ~= nil
+		end
+
 		if #values == 0 then
 			if emptied then
 				if #stored > 0 then
 					config_audit("用户清空了 " .. tostring(self.option) .. "（原有 "
-						.. #stored .. " 项）")
+						.. #stored .. " 项，diag=" .. diag .. "）")
 				end
 			elseif #stored > 0 then
 				-- The widget reported nothing and the browser never confirmed
@@ -683,7 +714,10 @@ local function bind_list_option(option)
 				-- values back is unnecessary, UCI already holds them.
 				config_audit("表单未提交 " .. tostring(self.option)
 					.. " 的取值（posted=" .. dump_posted(posted)
-					.. "，stored=" .. #stored .. "），已保留原有 " .. #stored .. " 项")
+					.. "，stored=" .. #stored
+					.. "，diag=" .. diag
+					.. "，post=" .. dump_post_keys(self.map, cbid)
+					.. "），已保留原有 " .. #stored .. " 项")
 				return nil
 			else
 				return nil
@@ -1130,6 +1164,12 @@ add_file_upload_handler({
 -- on top of it. Only text the user actually edited participates - an
 -- untouched runtime snapshot must never overwrite the stored configuration.
 m.on_parse = function()
+	-- The editor textarea posts with every form save, so its presence marks a
+	-- real POST (page views never carry it). Log the build once per save.
+	if http.formvalue("_toml_editor_text") ~= nil then
+		config_audit("表单保存开始（build=" .. FORM_BUILD .. "）")
+	end
+
 	local content = http.formvalue("_toml_editor_text")
 	if type(content) == "table" then
 		content = table.concat(content, "\n")

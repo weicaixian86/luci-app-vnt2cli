@@ -8,10 +8,11 @@
 --   * the user removed the last item  -> the list must be cleared
 --   * the widget never reported back  -> the stored list must survive
 --
--- The hidden __empty input carries the client's explicit "the last item was
--- removed" signal; it is only set once a cbi-dynlist-change event was seen,
--- so a widget that hydrates empty on its own can never wipe the stored list.
-%><div class="vnt2-dynlist" data-cbid="<%=cbid%>"><input type="hidden" data-vnt2-empty name="<%=cbid%>.__empty" value="" /><%
+-- The browser is the only side that can tell them apart, so it reports what
+-- it saw: __diag carries the widget state (hydrated / item count / whether it
+-- ever showed an item) and __empty is set to 1 only when a widget that really
+-- displayed the stored items lost all of them.
+%><div class="vnt2-dynlist" data-cbid="<%=cbid%>"><input type="hidden" data-vnt2-empty name="<%=cbid%>.__empty" value="" /><input type="hidden" data-vnt2-diag name="<%=cbid%>.__diag" value="" /><%
 -- Stored mirror: these inputs live OUTSIDE the widget placeholder below, so
 -- cbi.js hydration (which replaces that placeholder) can never remove them.
 -- They are the server's memory of what was configured when the page was
@@ -47,59 +48,95 @@ end
 %></div>
 </div>
 <script type="text/javascript">(function() {
-	if (window.vnt2DynlistGuard) {
-		window.vnt2DynlistSync();
-		return;
-	}
-	window.vnt2DynlistGuard = true;
+	if (!window.vnt2DynlistGuard) {
+		window.vnt2DynlistGuard = true;
 
-	function host_of(node) {
-		while (node && node.nodeType === 1) {
-			if (node.classList && node.classList.contains('vnt2-dynlist')) {
-				return node;
+		// Self healing: a widget that came up empty although the page rendered
+		// stored values lost them (hydration raced the value list, or the
+		// widget was rebuilt). Feed the stored values back into the widget so
+		// the user sees them again and they are posted on save.
+		window.vnt2DynlistRepair = function(host, widget) {
+			if (host.getAttribute('data-repaired') === '1') {
+				return;
 			}
-			node = node.parentNode;
-		}
-		return null;
+			var stored = host.querySelectorAll('input[name$=".__stored"]');
+			if (stored.length === 0) {
+				return;
+			}
+			if (widget.querySelectorAll('.item').length >= stored.length) {
+				host.setAttribute('data-repaired', '1');
+				return;
+			}
+			var L = window.L;
+			if (!L || !L.dom || typeof L.dom.callClassMethod !== 'function') {
+				return;
+			}
+			host.setAttribute('data-repaired', '1');
+			for (var j = 0; j < stored.length; j++) {
+				try {
+					L.dom.callClassMethod(widget, 'addItem', widget, stored[j].value, null);
+				} catch (e) {
+					return;
+				}
+			}
+		};
+
+		window.vnt2DynlistSync = function(submitting) {
+			var hosts = document.querySelectorAll('.vnt2-dynlist'), i;
+			for (i = 0; i < hosts.length; i++) {
+				var host = hosts[i];
+				var widget = host.querySelector('.cbi-dynlist');
+				var items = widget ? widget.querySelectorAll('.item').length : -1;
+
+				if (items > 0) {
+					host.setAttribute('data-seen', '1');
+				}
+
+				if (!submitting) {
+					if (widget) {
+						window.vnt2DynlistRepair(host, widget);
+					}
+					continue;
+				}
+
+				var seen = (host.getAttribute('data-seen') === '1');
+				var flag = host.querySelector('input[data-vnt2-empty]');
+				var diag = host.querySelector('input[data-vnt2-diag]');
+
+				if (diag) {
+					diag.value = 'h=' + (widget ? 1 : 0) + ';i=' + items + ';s=' + (seen ? 1 : 0);
+				}
+
+				// Only a widget that really rendered the stored items and then
+				// lost them may clear the list. A widget that never showed an
+				// item - a hydration failure, a submit before hydration, or a
+				// list that started out empty - must never wipe the stored
+				// configuration.
+				if (flag) {
+					flag.value = (widget && items === 0 && seen) ? '1' : '';
+				}
+			}
+		};
+
+		document.addEventListener('cbi-dynlist-change', function() {
+			window.vnt2DynlistSync(false);
+		});
+
+		document.addEventListener('submit', function() {
+			window.vnt2DynlistSync(true);
+		}, true);
+
+		window.addEventListener('load', function() {
+			window.vnt2DynlistSync(false);
+		});
+
+		[300, 1500, 4000].forEach(function(delay) {
+			window.setTimeout(function() {
+				window.vnt2DynlistSync(false);
+			}, delay);
+		});
 	}
 
-	function mark(host) {
-		if (!host) {
-			return;
-		}
-		var flag = host.querySelector('input[data-vnt2-empty]');
-		if (!flag) {
-			return;
-		}
-		var widget = host.querySelector('.cbi-dynlist');
-		if (!widget || host.getAttribute('data-touched') !== '1') {
-			// Not hydrated yet, or the user never touched this list: an empty
-			// post means "state unknown", never "delete everything".
-			flag.value = '';
-			return;
-		}
-		flag.value = (widget.querySelectorAll('.item').length === 0) ? '1' : '';
-	}
-
-	window.vnt2DynlistSync = function() {
-		var hosts = document.querySelectorAll('.vnt2-dynlist'), i;
-		for (i = 0; i < hosts.length; i++) {
-			mark(hosts[i]);
-		}
-	};
-
-	document.addEventListener('cbi-dynlist-change', function(ev) {
-		var host = host_of(ev.target);
-		if (!host) {
-			return;
-		}
-		host.setAttribute('data-touched', '1');
-		mark(host);
-	});
-
-	document.addEventListener('submit', window.vnt2DynlistSync, true);
-	window.addEventListener('load', window.vnt2DynlistSync);
-	window.setTimeout(window.vnt2DynlistSync, 2000);
-	window.vnt2DynlistSync();
+	window.vnt2DynlistSync(false);
 })();</script>
 <%+cbi/valuefooter%>
