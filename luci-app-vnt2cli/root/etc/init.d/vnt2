@@ -245,7 +245,12 @@ export_client_config() {
 	network_code="$(config_get "$cfg" "network_code")"
 	subscription="$(config_get "$cfg" "subscription")"
 	if [ -z "$network_code" ] && [ -z "$subscription" ]; then
-		log_service 'export failed: client config missing network_code and subscription'
+		# The client simply is not configured yet. That is not a start
+		# failure: reporting one makes the service look broken and hands the
+		# restart worker a reason to retry a start that cannot succeed until
+		# the user fills in the config.
+		EXPORT_NOT_CONFIGURED=1
+		log_service 'export skipped: client config missing network_code and subscription'
 		rm -f "$tmp"
 		return 1
 	fi
@@ -2226,7 +2231,12 @@ start_cli_instance() {
 
 	# Always refresh the runtime TOML, even while the client is stopped: the
 	# config editor reads this file and it must mirror UCI.
+	EXPORT_NOT_CONFIGURED=0
 	if ! export_client_config "$cfg"; then
+		if [ "$enabled" = "1" ] && [ "$EXPORT_NOT_CONFIGURED" = "1" ]; then
+			log_service 'client enabled but not configured; start skipped'
+			return 0
+		fi
 		if [ "$enabled" = "1" ]; then
 			log_service 'start failed: runtime toml export failed'
 			return 1

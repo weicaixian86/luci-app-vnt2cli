@@ -65,6 +65,8 @@ assert_not_contains "$INIT" 'conf_file' "no config-file selection in init"
 assert_not_contains "$INIT" 'vnt_config' "no /vnt_config usage in init"
 assert_contains "$INIT" 'NETWORK_SYNC_RESULT="no-device-mode"' "device_mode no cleans managed network objects"
 assert_contains "$INIT" 'NETWORK_SYNC_RESULT="pending-device:${tun_name}"' "the interface is configured before the runtime device exists"
+assert_contains "$INIT" 'EXPORT_NOT_CONFIGURED=1' "an unconfigured client is reported as such, not as an export failure"
+assert_contains "$INIT" 'client enabled but not configured; start skipped' "an enabled but unconfigured client skips the start instead of failing it"
 assert_not_contains "$INIT" 'NETWORK_SYNC_RESULT="missing-runtime-device"' "a missing device no longer removes the interface and zone"
 assert_contains "$INIT" 'network sync pending: VNT2 waits for device' "a pending ifup is reported, not treated as a failure"
 
