@@ -2004,13 +2004,11 @@ sync_network_state() {
 	fi
 
 	if [ -z "$tun_name" ]; then
-		log_service "network sync waiting for ${mode} device"
 		cleanup_network || return 1
 		NETWORK_SYNC_RESULT="missing-runtime-device"
 		return 0
 	fi
 	if ! device_has_any_ipv4_address "$tun_name"; then
-		log_service "network sync waiting for IPv4 address on ${tun_name}"
 		cleanup_network || return 1
 		NETWORK_SYNC_RESULT="missing-runtime-address"
 		return 0
