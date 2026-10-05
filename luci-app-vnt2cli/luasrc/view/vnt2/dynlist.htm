@@ -2,21 +2,21 @@
 <%
 -- Clearing guard for dynamic lists.
 --
--- The widget below only exists as a data-ui-widget placeholder until cbi.js
--- hydrates it; the real inputs are created client side. An empty post
--- therefore has two very different meanings:
+-- The widget below starts life as a data-ui-widget placeholder; cbi.js
+-- replaces that node with the real widget after the page has loaded, and the
+-- values then live in hidden inputs the widget creates client side. An empty
+-- post is therefore ambiguous:
 --   * the user removed the last item  -> the list must be cleared
---   * the widget never reported back  -> the stored list must survive
+--   * the widget never rendered them  -> the stored list must survive
 --
--- The browser is the only side that can tell them apart, so it reports what
--- it saw: __diag carries the widget state (hydrated / item count / whether it
--- ever showed an item) and __empty is set to 1 only when a widget that really
--- displayed the stored items lost all of them.
-%><div class="vnt2-dynlist" data-cbid="<%=cbid%>"><input type="hidden" data-vnt2-empty name="<%=cbid%>.__empty" value="" /><input type="hidden" data-vnt2-diag name="<%=cbid%>.__diag" value="" /><%
--- Stored mirror: these inputs live OUTSIDE the widget placeholder below, so
--- cbi.js hydration (which replaces that placeholder) can never remove them.
--- They are the server's memory of what was configured when the page was
--- rendered, and are what a save falls back to when the widget posts nothing.
+-- Only the browser can tell those apart, so it reports the widget's own item
+-- list when the form is submitted:
+--   * __hyd    "1"  - the widget took over and __values is authoritative
+--   * __values      - the widget's items, one per line (empty = all removed)
+-- The stored values are mirrored into __stored inputs outside the placeholder,
+-- so hydration can never remove them; the server falls back to them whenever
+-- the widget did not take over.
+%><div class="vnt2-dynlist" data-cbid="<%=cbid%>"><input type="hidden" data-vnt2-hyd name="<%=cbid%>.__hyd" value="" /><input type="hidden" data-vnt2-values name="<%=cbid%>.__values" value="" /><%
 local _vals = self:cfgvalue(section)
 if type(_vals) == "table" then
 	for _, _v in ipairs(_vals) do
@@ -82,43 +82,76 @@ end
 		};
 
 		window.vnt2DynlistSync = function(submitting) {
-			var hosts = document.querySelectorAll('.vnt2-dynlist'), i;
+			var hosts = document.querySelectorAll('.vnt2-dynlist'), i, j;
 			for (i = 0; i < hosts.length; i++) {
 				var host = hosts[i];
-				var widget = host.querySelector('.cbi-dynlist');
-				var items = widget ? widget.querySelectorAll('.item').length : -1;
+				var cbid = host.getAttribute('data-cbid') || '';
+				var ph = host.vnt2Placeholder;
+				if (ph === undefined) {
+					ph = host.querySelector('div[data-ui-widget]');
+					host.vnt2Placeholder = ph;
+				}
 
-				if (items > 0) {
+				// cbi.js replaces the placeholder node with the rendered
+				// widget. The detached node is the only reliable hydration
+				// signal; class names and markup belong to the widget.
+				var hydrated = true;
+				if (ph) {
+					hydrated = !(ph.isConnected === true || document.documentElement.contains(ph));
+				}
+
+				var widget = host.querySelector('.cbi-dynlist');
+				var inputs = host.querySelectorAll('input[name="' + cbid + '"]');
+				var values = [];
+				for (j = 0; j < inputs.length; j++) {
+					var v = (inputs[j].value || '').replace(/^\s+|\s+$/g, '');
+					if (v !== '') {
+						values.push(v);
+					}
+				}
+				if (values.length > 0) {
 					host.setAttribute('data-seen', '1');
+					host.setAttribute('data-armed', '1');
 				}
 
 				if (!submitting) {
-					if (widget) {
+					if (hydrated && widget) {
 						window.vnt2DynlistRepair(host, widget);
 					}
 					continue;
 				}
 
+				var hyd = host.querySelector('input[data-vnt2-hyd]');
+				var out = host.querySelector('input[data-vnt2-values]');
+				if (!hyd || !out) {
+					continue;
+				}
+
+				var storedCount = host.querySelectorAll('input[name$=".__stored"]').length;
 				var seen = (host.getAttribute('data-seen') === '1');
-				var flag = host.querySelector('input[data-vnt2-empty]');
-				var diag = host.querySelector('input[data-vnt2-diag]');
+				var touched = (host.getAttribute('data-touched') === '1');
 
-				if (diag) {
-					diag.value = 'h=' + (widget ? 1 : 0) + ';i=' + items + ';s=' + (seen ? 1 : 0);
-				}
-
-				// Only a widget that really rendered the stored items and then
-				// lost them may clear the list. A widget that never showed an
-				// item - a hydration failure, a submit before hydration, or a
-				// list that started out empty - must never wipe the stored
-				// configuration.
-				if (flag) {
-					flag.value = (widget && items === 0 && seen) ? '1' : '';
-				}
+				// An empty widget is only trusted when it really displayed the
+				// stored items and then lost them through a user action. A
+				// widget that never showed an item - a hydration race or a
+				// rebuild - must never wipe the stored configuration, so it
+				// reports "not authoritative" and the server keeps the values.
+				var authoritative = hydrated &&
+					(values.length > 0 || storedCount === 0 || (seen && touched));
+				hyd.value = authoritative ? '1' : '0';
+				out.value = values.join('\n');
 			}
 		};
 
-		document.addEventListener('cbi-dynlist-change', function() {
+		// Only an armed host (one that was really seen holding its values)
+		// may treat a later removal as the user's own change.
+		document.addEventListener('cbi-dynlist-change', function(ev) {
+			var hosts = document.querySelectorAll('.vnt2-dynlist[data-armed="1"]'), i;
+			for (i = 0; i < hosts.length; i++) {
+				if (hosts[i].contains(ev.target)) {
+					hosts[i].setAttribute('data-touched', '1');
+				}
+			}
 			window.vnt2DynlistSync(false);
 		});
 

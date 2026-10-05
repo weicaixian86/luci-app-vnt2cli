@@ -63,9 +63,19 @@ local rendered_text = tostring(self:cfgvalue(section) or "")
 	var readUrl = "<%=toml_read_url%>";
 	var saveUrl = "<%=toml_save_url%>";
 	var dirty = false;
+	// Everything the server put into the editor - the rendered text and every
+	// runtime snapshot loaded below - is the baseline. Anything else can only
+	// have come from the user, so comparing against it decides whether the
+	// form submit has to merge the text. Key events alone are not reliable:
+	// a programmatically filled textarea fires none of them.
+	var baseline = "";
 
 	function editor() {
 		return document.getElementById("vnt2_toml_editor");
+	}
+
+	function setBaseline(text) {
+		baseline = text || "";
 	}
 
 	function setDirty(state) {
@@ -74,6 +84,20 @@ local rendered_text = tostring(self:cfgvalue(section) or "")
 		if (flag) {
 			flag.value = state ? "1" : "";
 		}
+	}
+
+	// Decides whether the text the form is about to post was edited. Called
+	// from the submit handler, so it runs after every keystroke, paste, drag
+	// and widget change, whichever of them the browser reported.
+	function syncDirty() {
+		if (dirty) {
+			return true;
+		}
+		var node = editor();
+		if (node && node.value !== baseline) {
+			setDirty(true);
+		}
+		return dirty;
 	}
 
 	function setMessage(text, ok) {
@@ -87,6 +111,7 @@ local rendered_text = tostring(self:cfgvalue(section) or "")
 		XHR.get(readUrl, null, function(x, data) {
 			if (data && data.ok) {
 				editor().value = data.content || "";
+				setBaseline(editor().value);
 				setDirty(false);
 				setMessage(data.source === "file"
 					? "已加载运行配置 /tmp/vnt2cli.toml（客户端实际加载的完整配置）"
@@ -107,6 +132,7 @@ local rendered_text = tostring(self:cfgvalue(section) or "")
 		}
 		XHR.post(saveUrl, { content: content }, function(x, data) {
 		if (data && data.ok) {
+			setBaseline(content);
 			setDirty(false);
 				setMessage((data.hint || "已保存。") + " 页面即将刷新以同步表单取值…", true);
 				// The rest of the form still holds the values rendered before
@@ -123,7 +149,11 @@ local rendered_text = tostring(self:cfgvalue(section) or "")
 
 	var node = editor();
 	if (node) {
+		setBaseline(node.value);
 		node.addEventListener("input", function() {
+			setDirty(true);
+		});
+		node.addEventListener("change", function() {
 			setDirty(true);
 		});
 
@@ -140,6 +170,13 @@ local rendered_text = tostring(self:cfgvalue(section) or "")
 			});
 		}
 	}
+
+	// LuCI submits the whole CBI form, so the dirty flag is settled here at
+	// the latest. It has to happen before the browser serialises the form,
+	// which it does after every submit listener has run.
+	document.addEventListener("submit", function() {
+		syncDirty();
+	}, true);
 
 	// A back/forward cache restore brings back the DOM of an older render - both
 	// the form fields and this editor would then hold pre-save values that a
