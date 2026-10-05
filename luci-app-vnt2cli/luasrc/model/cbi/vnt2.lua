@@ -42,7 +42,7 @@ local list_options = {}
 -- Bumped whenever the save path changes. Every form save logs it, so a report
 -- can be matched against the code that produced it instead of guessing which
 -- build the device is running.
-local FORM_BUILD = "2026-10-05.5"
+local FORM_BUILD = "2026-10-05.6"
 
 -- Audit trail for config mutations: when a populated list gets cleared the
 -- running log records who did it, so silent losses are diagnosable.
@@ -1254,6 +1254,12 @@ m.on_after_save = function()
 		table.sort(restored)
 		config_audit("保存审计：已恢复被清空的 " .. table.concat(restored, "、")
 			.. "（本次请求未提交清空）")
+		-- The restores above were written after Map.parse had already taken its
+		-- UCI savepoint (uci:save runs before on_after_save). LuCI's deferred
+		-- apply commits from that savepoint, not from the live cursor, so the
+		-- corrected lists would otherwise be thrown away by the later commit.
+		-- Re-take the savepoint so the restored values actually persist.
+		m.uci:save("vnt2")
 	end
 	if #changed > 0 then
 		table.sort(changed)
