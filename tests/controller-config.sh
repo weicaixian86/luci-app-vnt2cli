@@ -43,9 +43,10 @@ assert_not_contains() {
 
 # --- menu and pages ---
 assert_contains "$CTRL" '"admin", "vpn", "vnt2"' "menu entry under VPN"
-assert_contains "$CTRL" 'cbi("vnt2")' "basic settings page registered"
+assert_contains "$CTRL" 'cbi("vnt2"), _("插件设置")' "plugin settings page registered"
 assert_contains "$CTRL" 'cbi("vnt2_status"), _("运行信息")' "runtime info page registered as cbi form"
 assert_contains "$CTRL" 'cbi("vnt2_runtime_log")' "runtime log page registered"
+assert_not_contains "$MODEL" 'vnt2_cli 客户端设置' "no section title on the settings form"
 assert_not_contains "$CTRL" "act_config_" "config management endpoints removed"
 assert_not_contains "$CTRL" "vnt2_config" "config management page references removed"
 if [ ! -f "${PKG_DIR}/luasrc/view/vnt2/vnt2_config.htm" ]; then

@@ -20,7 +20,7 @@ function index()
 	end
 
 	entry({ "admin", "vpn", "vnt2" }, alias("admin", "vpn", "vnt2", "config"), _("VNT2"), 45).dependent = true
-	entry({ "admin", "vpn", "vnt2", "config" }, cbi("vnt2"), _("基本设置"), 10).leaf = true
+	entry({ "admin", "vpn", "vnt2", "config" }, cbi("vnt2"), _("插件设置"), 10).leaf = true
 	entry({ "admin", "vpn", "vnt2", "info" }, cbi("vnt2_status"), _("运行信息"), 20).leaf = true
 	entry({ "admin", "vpn", "vnt2", "runtime_log" }, cbi("vnt2_runtime_log"), _("运行日志"), 30).leaf = true
 
@@ -598,7 +598,7 @@ local function toml_serialize_uci()
 	end
 
 	local out = {}
-	out[#out + 1] = "# VNT 客户端配置（与基本设置页同源；保存后写回插件配置并排队重启生效）"
+	out[#out + 1] = "# VNT 客户端配置（与设置表单同源；保存后写回插件配置并排队重启生效）"
 
 	for _, key in ipairs(TOML_EDIT_KEY_ORDER) do
 		local value = uci:get("vnt2", section, key)

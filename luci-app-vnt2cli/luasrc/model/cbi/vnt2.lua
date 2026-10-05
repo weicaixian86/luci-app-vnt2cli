@@ -650,7 +650,7 @@ end
 
 -- ==================== vnt2_cli ====================
 ;(function()
-local w = m:section(TypedSection, "vnt2_cli", translate("vnt2_cli 客户端设置"))
+local w = m:section(TypedSection, "vnt2_cli")
 w.anonymous = true
 w.addremove = false
 
