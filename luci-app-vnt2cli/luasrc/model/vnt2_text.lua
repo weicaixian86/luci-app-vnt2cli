@@ -320,4 +320,373 @@ function M.merge_log_files(paths, max_lines)
 	return table.concat(output, "\n")
 end
 
+
+-- ---------- 编辑配置：UCI <-> TOML 文本往返 ----------
+-- Shared by the controller endpoint and the settings model: the editor never
+-- touches /tmp/vnt2cli.toml itself (that file is re-exported from UCI on every
+-- start). Saving is a partial merge - only keys present in the text are
+-- written back to UCI, every other key keeps its value.
+
+local function trim(value)
+	return (tostring(value or ""):gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+local TOML_EDIT_STR_KEYS = {
+	subscription = true,
+	network_code = true,
+	ip = true,
+	device_mode = true,
+	tun_name = true,
+	device_id = true,
+	device_name = true,
+	outbound_interface = true,
+	password = true,
+	cert_mode = true,
+	event_script = true
+}
+
+local TOML_EDIT_LIST_KEYS = {
+	server = true,
+	peer_address = true,
+	turn = true,
+	punch_model = true,
+	input = true,
+	subnet_mapping = true,
+	output = true,
+	port_mapping = true,
+	udp_stun = true,
+	tcp_stun = true,
+	tunnel_addr = true
+}
+
+local TOML_EDIT_BOOL_KEYS = {
+	no_punch = true,
+	no_broadcast = true,
+	allow_ikev2 = true,
+	allow_wireguard = true,
+	rtx = true,
+	compress = true,
+	fec = true,
+	auto_sync_subnet = true,
+	no_nat = true,
+	allow_mapping = true
+}
+
+local TOML_EDIT_NUM_KEYS = {
+	mtu = true,
+	tunnel_port = true
+}
+
+local TOML_EDIT_KEY_ORDER = {
+	"subscription", "server", "peer_address", "turn", "punch_model",
+	"network_code", "ip", "no_punch", "no_broadcast", "allow_ikev2",
+	"allow_wireguard", "rtx", "compress", "fec", "input",
+	"subnet_mapping", "output", "auto_sync_subnet", "no_nat", "device_mode",
+	"mtu", "port_mapping", "allow_mapping", "device_id", "device_name",
+	"tun_name", "outbound_interface", "password", "cert_mode", "udp_stun",
+	"tcp_stun", "tunnel_addr", "tunnel_port", "event_script"
+}
+
+local function toml_quote(value)
+	local s = tostring(value or "")
+	s = s:gsub("\\", "\\\\"):gsub('"', '\\"'):gsub("[%z\r\n]", " ")
+	return '"' .. s .. '"'
+end
+
+function M.toml_serialize_uci(uci)
+	local section = uci:get_first("vnt2", "vnt2_cli")
+	if not section then
+		return "# 未找到 vnt2_cli 配置节，请重新安装本插件\n"
+	end
+
+	local out = {}
+	out[#out + 1] = "# VNT 客户端配置（与设置表单同源；保存后写回插件配置并排队重启生效）"
+
+	for _, key in ipairs(TOML_EDIT_KEY_ORDER) do
+		local value = uci:get("vnt2", section, key)
+		if value ~= nil and value ~= "" then
+			if TOML_EDIT_BOOL_KEYS[key] then
+				out[#out + 1] = key .. " = " .. (value == "1" and "true" or "false")
+			elseif TOML_EDIT_LIST_KEYS[key] then
+				local items = {}
+				if type(value) == "table" then
+					for _, item in ipairs(value) do
+						item = trim(item)
+						if item ~= "" then
+							items[#items + 1] = toml_quote(item)
+						end
+					end
+				elseif trim(tostring(value)) ~= "" then
+					items[#items + 1] = toml_quote(trim(tostring(value)))
+				end
+				if #items > 0 then
+					out[#out + 1] = key .. " = [" .. table.concat(items, ", ") .. "]"
+				end
+			elseif TOML_EDIT_NUM_KEYS[key] then
+				local n = tonumber(trim(tostring(value)))
+				if n then
+					out[#out + 1] = key .. " = " .. tostring(math.floor(n))
+				end
+			else
+				out[#out + 1] = key .. " = " .. toml_quote(trim(tostring(value)))
+			end
+		end
+	end
+
+	return table.concat(out, "\n") .. "\n"
+end
+
+local function toml_strip_comment(line)
+	local out = {}
+	local in_str = false
+	local esc = false
+	for i = 1, #line do
+		local c = line:sub(i, i)
+		if in_str then
+			out[#out + 1] = c
+			if esc then
+				esc = false
+			elseif c == "\\" then
+				esc = true
+			elseif c == '"' then
+				in_str = false
+			end
+		else
+			if c == "#" then
+				break
+			end
+			out[#out + 1] = c
+			if c == '"' then
+				in_str = true
+			end
+		end
+	end
+	return table.concat(out)
+end
+
+local function toml_unquote(s)
+	s = s:gsub("\\\\", "\001")
+	s = s:gsub('\\"', '"')
+	s = s:gsub("\001", "\\")
+	return s
+end
+
+local function toml_parse_array(inner)
+	local items = {}
+	local pos = 1
+
+	while pos <= #inner do
+		local c = inner:sub(pos, pos)
+		if c == " " or c == "\t" or c == "," then
+			pos = pos + 1
+		elseif c == '"' then
+			pos = pos + 1
+			local item = {}
+			local esc = false
+			local closed = false
+			while pos <= #inner do
+				local ch = inner:sub(pos, pos)
+				if esc then
+					item[#item + 1] = ch
+					esc = false
+					pos = pos + 1
+				elseif ch == "\\" then
+					item[#item + 1] = ch
+					esc = true
+					pos = pos + 1
+				elseif ch == '"' then
+					closed = true
+					pos = pos + 1
+					break
+				else
+					item[#item + 1] = ch
+					pos = pos + 1
+				end
+			end
+			if not closed then
+				return nil
+			end
+			items[#items + 1] = toml_unquote(table.concat(item))
+		else
+			return nil
+		end
+	end
+
+	return items
+end
+
+function M.toml_parse_config(text)
+	local values = {}
+	local unknown = {}
+	local lineno = 0
+
+	for line in tostring(text or ""):gmatch("[^\r\n]+") do
+		lineno = lineno + 1
+		local content = trim(toml_strip_comment(line))
+		if content ~= "" then
+			local key, val = content:match("^([A-Za-z_][A-Za-z0-9_]*)%s*=%s*(.-)$")
+			val = val and trim(val) or ""
+			if not key or val == "" then
+				return nil, "第 " .. lineno .. " 行不是有效的 TOML 键值"
+			end
+			if key == "no_tun" then
+				return nil, "已废弃键 no_tun：请改用 device_mode"
+			end
+			if not (TOML_EDIT_STR_KEYS[key] or TOML_EDIT_LIST_KEYS[key]
+				or TOML_EDIT_BOOL_KEYS[key] or TOML_EDIT_NUM_KEYS[key]) then
+				unknown[#unknown + 1] = key .. " (第 " .. lineno .. " 行)"
+			elseif val:sub(1, 1) == "[" then
+				if val:sub(-1) ~= "]" then
+					return nil, "第 " .. lineno .. " 行数组未闭合"
+				end
+				local items = toml_parse_array(val:sub(2, -2))
+				if not items then
+					return nil, "第 " .. lineno .. " 行数组格式无效"
+				end
+				values[key] = items
+			elseif val == "true" or val == "false" then
+				if not TOML_EDIT_BOOL_KEYS[key] then
+					return nil, "第 " .. lineno .. " 行的键不接受布尔值"
+				end
+				values[key] = (val == "true")
+			elseif val:sub(1, 1) == '"' then
+				if #val < 2 or val:sub(-1) ~= '"' then
+					return nil, "第 " .. lineno .. " 行字符串未闭合"
+				end
+				if not TOML_EDIT_STR_KEYS[key] then
+					return nil, "第 " .. lineno .. " 行的键不接受字符串值"
+				end
+				values[key] = toml_unquote(val:sub(2, -2))
+			elseif val:match("^%d+$") then
+				if not (TOML_EDIT_NUM_KEYS[key] or TOML_EDIT_STR_KEYS[key] or TOML_EDIT_LIST_KEYS[key]) then
+					return nil, "第 " .. lineno .. " 行的键不接受数值"
+				end
+				values[key] = val
+			else
+				return nil, "第 " .. lineno .. " 行的值类型无效"
+			end
+		end
+	end
+
+	return values, nil, unknown
+end
+
+local function toml_list_equal(current, items)
+	local cur = {}
+	if type(current) == "table" then
+		for _, item in ipairs(current) do
+			item = trim(item)
+			if item ~= "" then
+				cur[#cur + 1] = item
+			end
+		end
+	elseif current ~= nil and trim(tostring(current)) ~= "" then
+		cur[#cur + 1] = trim(tostring(current))
+	end
+
+	if #cur ~= #items then
+		return false
+	end
+	for i, item in ipairs(items) do
+		if cur[i] ~= item then
+			return false
+		end
+	end
+	return true
+end
+
+function M.toml_apply_to_uci(uci, values)
+	local section = uci:get_first("vnt2", "vnt2_cli")
+	if not section then
+		return nil, "未找到 vnt2_cli 配置节"
+	end
+
+	if values.device_mode and values.device_mode ~= "no"
+		and values.device_mode ~= "tun" and values.device_mode ~= "tap" then
+		return nil, "device_mode 仅支持 no、tun、tap"
+	end
+	if values.cert_mode and values.cert_mode ~= ""
+		and values.cert_mode ~= "skip" and values.cert_mode ~= "standard"
+		and not values.cert_mode:match("^finger:[0-9a-fA-F]+$") then
+		return nil, "cert_mode 仅支持 skip、standard 或 finger:指纹"
+	end
+	if values.mtu then
+		local n = tonumber(values.mtu)
+		if not n or math.floor(n) ~= n or n < 1 or n > 65535 then
+			return nil, "mtu 必须为 1~65535 的整数"
+		end
+	end
+	if values.tunnel_port then
+		local n = tonumber(values.tunnel_port)
+		if not n or n < 0 or n > 65535 then
+			return nil, "tunnel_port 必须为 0~65535 的整数"
+		end
+	end
+	if values.tunnel_addr and #values.tunnel_addr > 0 and values.tunnel_port then
+		return nil, "tunnel_addr 与 tunnel_port 互斥，不能同时填写"
+	end
+
+	-- Partial merge: only keys present in the text are considered, and only
+	-- keys whose value actually differs are written; the stored configuration
+	-- is never touched by a save that changes nothing.
+	local applied = 0
+	for _, key in ipairs(TOML_EDIT_KEY_ORDER) do
+		local value = values[key]
+		if value ~= nil then
+			if TOML_EDIT_BOOL_KEYS[key] then
+				local want = (value == true) and "1" or "0"
+				if uci:get("vnt2", section, key) ~= want then
+					uci:set("vnt2", section, key, want)
+					applied = applied + 1
+				end
+			elseif TOML_EDIT_NUM_KEYS[key] then
+				local want = tostring(value)
+				if uci:get("vnt2", section, key) ~= want then
+					uci:set("vnt2", section, key, want)
+					applied = applied + 1
+				end
+			elseif TOML_EDIT_LIST_KEYS[key] then
+				local items = {}
+				if type(value) == "table" then
+					for _, item in ipairs(value) do
+						item = trim(tostring(item))
+						if item ~= "" then
+							items[#items + 1] = item
+						end
+					end
+				else
+					local item = trim(tostring(value))
+					if item ~= "" then
+						items[#items + 1] = item
+					end
+				end
+				if not toml_list_equal(uci:get("vnt2", section, key), items) then
+					uci:delete("vnt2", section, key)
+					if #items > 0 then
+						uci:set_list("vnt2", section, key, items)
+					end
+					applied = applied + 1
+				end
+			else
+				local s = trim(tostring(value))
+				if s == "" then
+					local cur = uci:get("vnt2", section, key)
+					if cur ~= nil and cur ~= "" then
+						uci:delete("vnt2", section, key)
+						applied = applied + 1
+					end
+				elseif uci:get("vnt2", section, key) ~= s then
+					uci:set("vnt2", section, key, s)
+					applied = applied + 1
+				end
+			end
+		end
+	end
+
+	if applied > 0 then
+		uci:commit("vnt2")
+	end
+	return true, applied
+end
+
 return M

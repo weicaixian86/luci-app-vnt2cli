@@ -3,6 +3,7 @@ local fs = require "nixio.fs"
 local nixio = require "nixio"
 local util = require "luci.util"
 local uci = require "luci.model.uci".cursor()
+local textutil = require "luci.model.vnt2_text"
 
 local UPLOAD_DIR = "/etc/vnt2/upload"
 local UPLOAD_PENDING_FILE = "/etc/vnt2/upload.pending"
@@ -1093,9 +1094,44 @@ cbi_options.cli_upload_note = cli_upload_note
 keep_absent_options(w)
 end)()
 
-
 add_file_upload_handler({
 	cbi_options.cli_upload_note
 })
+
+-- The edit-config tab's textarea posts with the form (name=_toml_editor_text).
+-- Save its content before the form options parse so the documented order
+-- holds: the text config is merged first, the form's own values are applied
+-- on top of it. Only text the user actually edited participates - an
+-- untouched runtime snapshot must never overwrite the stored configuration.
+m.on_parse = function()
+	local content = http.formvalue("_toml_editor_text")
+	if type(content) == "table" then
+		content = table.concat(content, "\n")
+	end
+	content = tostring(content or ""):gsub("%z", "")
+
+	if http.formvalue("_toml_editor_text_dirty") ~= "1" then
+		return
+	end
+	if trim(content) == "" or content == textutil.toml_serialize_uci(uci) then
+		return
+	end
+
+	local values, err = textutil.toml_parse_config(content)
+	if not values then
+		config_audit("编辑配置随表单保存：解析失败（" .. tostring(err) .. "），文本未写入")
+		return
+	end
+
+	local ok, applied = textutil.toml_apply_to_uci(uci, values)
+	if not ok then
+		config_audit("编辑配置随表单保存失败：" .. tostring(applied))
+		return
+	end
+	if applied > 0 then
+		config_audit("编辑配置随表单保存：部分合并 " .. tostring(applied)
+			.. " 个键（其余保持不变）")
+	end
+end
 
 return m

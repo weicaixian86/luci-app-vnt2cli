@@ -45,7 +45,12 @@ local toml_save_url = dsp.build_url("admin", "vpn", "vnt2", "toml_save")
 		<input class="cbi-button" type="button" onclick="vnt2TomlReload()" value="<%:重新加载%>" />
 		<span class="vnt2-toml-note"><%:保存只更新文本中出现的键，未出现的键保持不变（删除参数请使用设置表单）；保存后写回插件配置并由后台重启客户端生效。重新加载读取运行中的 /tmp/vnt2cli.toml。%></span>
 	</div>
-	<textarea id="vnt2_toml_editor" class="cbi-input-textarea" spellcheck="false" wrap="off"><%=self:cfgvalue(section)%></textarea>
+	<%-- The textarea posts with the surrounding form; the model merges it into
+	     UCI before the form fields parse, but only when the dirty flag says
+	     the user really edited the text (an untouched runtime snapshot must
+	     never overwrite the stored configuration). --%>
+	<input type="hidden" id="vnt2_toml_dirty" name="_toml_editor_text_dirty" value="" />
+	<textarea id="vnt2_toml_editor" name="_toml_editor_text" class="cbi-input-textarea" spellcheck="false" wrap="off"><%=self:cfgvalue(section)%></textarea>
 	<div class="vnt2-toml-msg" id="vnt2_toml_msg"></div>
 </div>
 
@@ -60,6 +65,14 @@ local toml_save_url = dsp.build_url("admin", "vpn", "vnt2", "toml_save")
 		return document.getElementById("vnt2_toml_editor");
 	}
 
+	function setDirty(state) {
+		dirty = state;
+		var flag = document.getElementById("vnt2_toml_dirty");
+		if (flag) {
+			flag.value = state ? "1" : "";
+		}
+	}
+
 	function setMessage(text, ok) {
 		var node = document.getElementById("vnt2_toml_msg");
 		if (!node) return;
@@ -71,7 +84,7 @@ local toml_save_url = dsp.build_url("admin", "vpn", "vnt2", "toml_save")
 		XHR.get(readUrl, null, function(x, data) {
 			if (data && data.ok) {
 				editor().value = data.content || "";
-				dirty = false;
+				setDirty(false);
 				setMessage(data.source === "file"
 					? "已加载运行配置 /tmp/vnt2cli.toml（客户端实际加载的完整配置）"
 					: "客户端未运行或运行配置尚未生成，已显示当前配置的序列化文本", true);
@@ -90,8 +103,8 @@ local toml_save_url = dsp.build_url("admin", "vpn", "vnt2", "toml_save")
 			return;
 		}
 		XHR.post(saveUrl, { content: content }, function(x, data) {
-			if (data && data.ok) {
-				dirty = false;
+		if (data && data.ok) {
+			setDirty(false);
 				setMessage((data.hint || "已保存。") + " 页面即将刷新以同步表单取值…", true);
 				// The rest of the form still holds the values rendered before
 				// this editor save. Reload so a later form submit cannot write
@@ -108,7 +121,7 @@ local toml_save_url = dsp.build_url("admin", "vpn", "vnt2", "toml_save")
 	var node = editor();
 	if (node) {
 		node.addEventListener("input", function() {
-			dirty = true;
+			setDirty(true);
 		});
 
 		// Refresh the editor text whenever its tab becomes visible, unless the
