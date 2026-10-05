@@ -2031,7 +2031,14 @@ sync_network_command() {
 	rc=$?
 	if [ "$rc" -eq 0 ]; then
 		if [ -n "$NETWORK_SYNC_RESULT" ]; then
-			log_service "network sync result: ${NETWORK_SYNC_RESULT}"
+			# The worker polls every second; record the result only when it
+			# changes so the running log is not flooded by steady state.
+			local last
+			last="$(cat /tmp/vnt2-sync.last 2>/dev/null)"
+			if [ "$last" != "$NETWORK_SYNC_RESULT" ]; then
+				log_service "network sync result: ${NETWORK_SYNC_RESULT}"
+				printf '%s\n' "$NETWORK_SYNC_RESULT" > /tmp/vnt2-sync.last
+			fi
 		fi
 		return 0
 	fi
