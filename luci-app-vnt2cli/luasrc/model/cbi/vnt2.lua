@@ -781,7 +781,7 @@ w:tab("security", translate("安全"))
 w:tab("edit", translate("编辑配置"))
 w:tab("upload", translate("上传程序"))
 
-local enabled = w:taboption("general", Flag, "enabled", translate("启用vnt2_cli 客户端"))
+local enabled = w:taboption("general", Flag, "enabled", translate("启用客户端"))
 enabled.rmempty = false
 enabled.default = "0"
 enabled.description = translate("启用后插件将本页配置导出为唯一运行配置并启动 vnt2_cli；保存应用由后台 worker 完成重启")
