@@ -1,15 +1,16 @@
 <style type="text/css">
-/* luci-compat form compaction for this page: pull the label column back to
-   the left edge instead of the theme's wide fixed-width title gutter. */
+/* luci-compat form compaction for this page: a fixed-width label column keeps
+   every control left-aligned on the same vertical line, and scalar inputs
+   share one uniform width. */
 #maincontent .cbi-value {
 	display: flex !important;
 	align-items: flex-start;
 	gap: 8px;
 }
 #maincontent .cbi-value > .cbi-value-title {
-	flex: 0 0 auto;
-	width: auto !important;
-	max-width: 50%;
+	flex: 0 0 160px;
+	width: 160px !important;
+	max-width: 160px;
 	float: none !important;
 	display: block !important;
 	margin: 0 !important;
@@ -23,5 +24,11 @@
 	width: auto !important;
 	float: none !important;
 	margin: 0 !important;
+}
+#maincontent .cbi-value > .cbi-value-field .cbi-input-text,
+#maincontent .cbi-value > .cbi-value-field .cbi-input-select {
+	width: 100%;
+	max-width: 340px;
+	box-sizing: border-box;
 }
 </style>
