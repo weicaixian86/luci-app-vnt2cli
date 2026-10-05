@@ -1,20 +1,21 @@
 <style type="text/css">
-/* luci-compat form compaction for this page: a fixed-width label column keeps
-   every control left-aligned on the same vertical line, and scalar inputs
-   share one uniform width. */
+/* luci-compat form layout for this page, matching the classic LuCI look:
+   right-aligned labels in a fixed-width column, every control starting on
+   the same vertical line, scalar widgets sharing one uniform width. */
 #maincontent .cbi-value {
 	display: flex !important;
 	align-items: flex-start;
 	gap: 8px;
 }
 #maincontent .cbi-value > .cbi-value-title {
-	flex: 0 0 160px;
-	width: 160px !important;
-	max-width: 160px;
+	flex: 0 0 200px;
+	width: 200px !important;
+	max-width: 200px;
 	float: none !important;
 	display: block !important;
 	margin: 0 !important;
-	text-align: left;
+	text-align: right;
+	padding-right: 14px;
 	padding-top: 2px;
 	word-break: break-word;
 }
