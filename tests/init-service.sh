@@ -64,6 +64,9 @@ assert_not_contains "$INIT" 'toml_get_' "no legacy toml parsers in init"
 assert_not_contains "$INIT" 'conf_file' "no config-file selection in init"
 assert_not_contains "$INIT" 'vnt_config' "no /vnt_config usage in init"
 assert_contains "$INIT" 'NETWORK_SYNC_RESULT="no-device-mode"' "device_mode no cleans managed network objects"
+assert_contains "$INIT" 'NETWORK_SYNC_RESULT="pending-device:${tun_name}"' "the interface is configured before the runtime device exists"
+assert_not_contains "$INIT" 'NETWORK_SYNC_RESULT="missing-runtime-device"' "a missing device no longer removes the interface and zone"
+assert_contains "$INIT" 'network sync pending: VNT2 waits for device' "a pending ifup is reported, not treated as a failure"
 
 # --- firewall: no web port rules, four forwarding directions kept ---
 assert_contains "$INIT" 'firewall.vnt2fwlan' "forwarding rule vnt2fwlan managed"
@@ -85,7 +88,10 @@ assert_contains "$INIT" 'version_state_matches_binary "$path" "cli"' "sidecar va
 RW="${PKG_DIR}/root/usr/libexec/vnt2/restart-worker"
 assert_not_contains "$RW" 'NETWORK_RECORD_FILE' "restart worker has no record file"
 assert_contains "$RW" 'uci -q show vnt2' "restart worker watches UCI changes"
-assert_contains "$RW" 'RESTART_DELAY="${VNT2_RESTART_DELAY:-15}"' "restart worker default 15s debounce"
+assert_contains "$RW" 'RESTART_DELAY="${VNT2_RESTART_DELAY:-5}"' "restart worker default 5s debounce"
+assert_contains "$RW" 'NETWORK_MIN_INTERVAL' "device churn is coalesced before a network reconcile"
+assert_contains "$RW" 'tun*|tap*|vnt*) interesting=1 ;;' "the snapshot only inspects tun/tap candidate devices"
+assert_contains "$RW" 'read -r flags <"$dir/tun_flags"' "sysfs attributes are read without forking a helper"
 assert_contains "$RW" 'claim_restart_request' "restart worker claims markers atomically"
 
 # --- upload worker ---

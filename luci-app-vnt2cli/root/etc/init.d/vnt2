@@ -1718,8 +1718,11 @@ configure_network() {
 		sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
 	fi
 	if ! apply_network_config_changes ifup; then
-		log_service "network sync pending: ifup VNT2 failed for ${tun_name}"
-		return 1
+		# The device does not have to exist yet: the interface is configured
+		# ahead of the client so the router shows it right away, and netifd
+		# brings it up when the card appears. A failed ifup is a pending
+		# state, not a failure, and must not trigger a retry storm.
+		log_service "network sync pending: VNT2 waits for device ${tun_name}"
 	fi
 	return 0
 }
@@ -1952,6 +1955,8 @@ sync_network_state() {
 	local enabled=0
 	local existing_device=""
 	local configured_ip=""
+	local detected=""
+	local pending=0
 
 	NETWORK_SYNC_RESULT=""
 	config_load "$CONF"
@@ -1960,8 +1965,15 @@ sync_network_state() {
 		config_get_bool enabled "$cfg" "enabled" "0"
 	fi
 
+	# The managed interface and firewall zone belong to the configured client,
+	# not to a device that happens to be up: they are created as soon as the
+	# client is enabled and only removed when it is disabled or runs without a
+	# virtual card. Waiting for the runtime device used to delay both by
+	# minutes - the card only appears once the tunnel is established - and
+	# dropped them again on every reconnect.
 	if [ "$enabled" != "1" ]; then
 		cleanup_network || return 1
+		NETWORK_SYNC_RESULT="client-disabled"
 		return 0
 	fi
 
@@ -1989,36 +2001,38 @@ sync_network_state() {
 		*) configured_ip="" ;;
 	esac
 
-	if [ -n "$tun_name" ]; then
-		case "$tun_name" in
-			*/*|*..*) tun_name="" ;;
-		esac
-		if [ -n "$tun_name" ] && device_matches_mode "$mode" "$tun_name"; then
-			: # The named runtime device exists and has the requested layer.
-		else
-			tun_name=""
-		fi
-	else
-		existing_device="$(trim_value "$(uci -q get network.VNT2.device 2>/dev/null || true)")"
-		tun_name="$(detect_configured_tun_device "$mode" "$configured_ip" "$existing_device" 2>/dev/null || true)"
-	fi
+	case "$tun_name" in
+		*/*|*..*) tun_name="" ;;
+	esac
 
-	if [ -z "$tun_name" ]; then
-		cleanup_network || return 1
-		NETWORK_SYNC_RESULT="missing-runtime-device"
-		return 0
-	fi
-	if ! device_has_any_ipv4_address "$tun_name"; then
-		cleanup_network || return 1
-		NETWORK_SYNC_RESULT="missing-runtime-address"
-		return 0
+	# A running device is the only binding known to be correct, so it wins.
+	detected="$(detect_configured_tun_device "$mode" "$configured_ip" "$tun_name" 2>/dev/null || true)"
+	if [ -n "$detected" ]; then
+		tun_name="$detected"
+	else
+		# The card is not up yet: bind the configured name (netifd waits for
+		# it), then whatever the interface already uses, then the kernel
+		# default name. The worker rebinds as soon as the real card shows up.
+		pending=1
+		if [ -z "$tun_name" ]; then
+			existing_device="$(trim_value "$(uci -q get network.VNT2.device 2>/dev/null || true)")"
+			if [ -n "$existing_device" ]; then
+				tun_name="$existing_device"
+			else
+				tun_name="${mode}0"
+			fi
+		fi
 	fi
 
 	if ! configure_network "$tun_name" "$forward_list" "$no_nat"; then
 		NETWORK_SYNC_RESULT="configure-failed:${tun_name}"
 		return 1
 	fi
-	NETWORK_SYNC_RESULT="configured:${tun_name}"
+	if [ "$pending" -eq 1 ]; then
+		NETWORK_SYNC_RESULT="pending-device:${tun_name}"
+	else
+		NETWORK_SYNC_RESULT="configured:${tun_name}"
+	fi
 	return 0
 }
 

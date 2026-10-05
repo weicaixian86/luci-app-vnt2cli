@@ -6,9 +6,13 @@ DOWNLOAD_LOG="${VNT2_RESTART_LOG_FILE:-/tmp/vnt2-download.log}"
 RESTART_COMMAND="${VNT2_RESTART_COMMAND:-/etc/init.d/vnt2}"
 NETWORK_SYNC_COMMAND="${VNT2_NETWORK_SYNC_COMMAND:-/etc/init.d/vnt2 sync_network}"
 SYS_CLASS_NET="${VNT2_SYS_CLASS_NET:-/sys/class/net}"
-RESTART_DELAY="${VNT2_RESTART_DELAY:-15}"
+RESTART_DELAY="${VNT2_RESTART_DELAY:-5}"
 POLL_INTERVAL="${VNT2_RESTART_POLL_INTERVAL:-1}"
 NETWORK_RETRY_INTERVAL="${VNT2_NETWORK_RETRY_INTERVAL:-5}"
+# A restart churns network devices for a few seconds. Reconciling on every
+# one of those intermediate states would reload netifd and the firewall over
+# and over, so device changes are coalesced for at least this long.
+NETWORK_MIN_INTERVAL="${VNT2_NETWORK_MIN_INTERVAL:-2}"
 NETWORK_SNAPSHOT=""
 NETWORK_SNAPSHOT_READY=0
 NETWORK_SYNC_FAILED=0
@@ -48,7 +52,7 @@ run_restart() {
 }
 
 read_network_snapshot() {
-	local name flags address ifindex details checksum
+	local name flags ifindex details address interesting bound
 
 	# UCI is the single source of truth for the one and only client config;
 	# any option change (enabled flag, client settings) triggers a network
@@ -57,30 +61,48 @@ read_network_snapshot() {
 	if [ -n "$checksum" ]; then
 		printf 'uci %s\n' "$checksum"
 	fi
-	if [ -d "$SYS_CLASS_NET" ]; then
-		for dir in "$SYS_CLASS_NET"/*; do
-			[ -d "$dir" ] || continue
-			name="${dir##*/}"
-			flags="$(cat "$dir/tun_flags" 2>/dev/null || true)"
-			ifindex="$(cat "$dir/ifindex" 2>/dev/null || true)"
-			# Include every interface directory in the snapshot. A device may
-			# appear before tun_flags is exported, and iproute2 details are the
-			# fallback type signal used by the init script.
+	[ -d "$SYS_CLASS_NET" ] || return 0
+	bound="$(uci -q get network.VNT2.device 2>/dev/null || true)"
+
+	for dir in "$SYS_CLASS_NET"/*; do
+		[ -d "$dir" ] || continue
+		name="${dir##*/}"
+
+		# Only tun/tap candidates need the iproute2 details. Inspecting every
+		# interface of the router on every poll forks ip twice per device and
+		# stalls the router instead of reconciling the tunnel, so the sysfs
+		# attributes (read without a fork) decide who is a candidate.
+		interesting=0
+		case "$name" in
+			tun*|tap*|vnt*) interesting=1 ;;
+		esac
+		[ "$name" = "$bound" ] && interesting=1
+
+		flags=""
+		if [ -r "$dir/tun_flags" ]; then
+			read -r flags <"$dir/tun_flags" 2>/dev/null || flags=""
+		fi
+		[ -n "$flags" ] && interesting=1
+
+		ifindex=""
+		if [ -r "$dir/ifindex" ]; then
+			read -r ifindex <"$dir/ifindex" 2>/dev/null || ifindex=""
+		fi
+
+		details=""
+		address=""
+		if [ "$interesting" -eq 1 ]; then
 			if command -v ip >/dev/null 2>&1; then
 				details="$(ip -d link show dev "$name" 2>/dev/null || true)"
-			else
-				details=""
-			fi
-			printf 'net-device %s %s %s %s\n' "$name" "$flags" "$ifindex" "$details"
-			if command -v ip >/dev/null 2>&1; then
 				address="$(ip -4 -o addr show dev "$name" 2>/dev/null || true)"
-				printf 'tun-address %s %s\n' "$name" "$address"
 			elif command -v ifconfig >/dev/null 2>&1; then
 				address="$(ifconfig "$name" 2>/dev/null | sed -n '/inet /p')"
-				printf 'tun-address %s %s\n' "$name" "$address"
 			fi
-		done
-	fi
+		fi
+
+		printf 'net-device %s %s %s %s\n' "$name" "$flags" "$ifindex" "$details"
+		printf 'tun-address %s %s\n' "$name" "$address"
+	done
 }
 
 sync_network_if_changed() {
@@ -91,13 +113,24 @@ sync_network_if_changed() {
 	case "$NETWORK_RETRY_INTERVAL" in
 		''|*[!0-9]*) NETWORK_RETRY_INTERVAL=5 ;;
 	esac
+	case "$NETWORK_MIN_INTERVAL" in
+		''|*[!0-9]*) NETWORK_MIN_INTERVAL=2 ;;
+	esac
 
-	if [ "$NETWORK_SNAPSHOT_READY" -eq 1 ] && [ "$snapshot" = "$NETWORK_SNAPSHOT" ] && [ "$NETWORK_SYNC_FAILED" -eq 0 ]; then
-		return 0
-	fi
-	if [ "$NETWORK_SNAPSHOT_READY" -eq 1 ] && [ "$snapshot" = "$NETWORK_SNAPSHOT" ] && [ "$NETWORK_SYNC_FAILED" -eq 1 ]; then
+	if [ "$NETWORK_SNAPSHOT_READY" -eq 1 ] && [ "$snapshot" = "$NETWORK_SNAPSHOT" ]; then
+		if [ "$NETWORK_SYNC_FAILED" -eq 0 ]; then
+			return 0
+		fi
 		elapsed=$((now - NETWORK_LAST_SYNC))
 		[ "$elapsed" -lt "$NETWORK_RETRY_INTERVAL" ] && return 0
+	else
+		# Something changed: reconcile at once, but not more often than the
+		# minimum interval - a restarting client churns devices for seconds
+		# and every intermediate state would otherwise reload the firewall.
+		elapsed=$((now - NETWORK_LAST_SYNC))
+		if [ "$NETWORK_SNAPSHOT_READY" -eq 1 ] && [ "$elapsed" -lt "$NETWORK_MIN_INTERVAL" ]; then
+			return 0
+		fi
 	fi
 
 	NETWORK_SNAPSHOT="$snapshot"
