@@ -42,7 +42,7 @@ local list_options = {}
 -- Bumped whenever the save path changes. Every form save logs it, so a report
 -- can be matched against the code that produced it instead of guessing which
 -- build the device is running.
-local FORM_BUILD = "2026-10-05.6"
+local FORM_BUILD = "2026-10-05.7"
 
 -- Audit trail for config mutations: when a populated list gets cleared the
 -- running log records who did it, so silent losses are diagnosable.
@@ -740,18 +740,45 @@ local function bind_list_option(option)
 		-- posts, so "marker without values" is a real user deselection.
 		local present = self.map:formvalue(cbid .. ".__present") ~= nil
 		local hyd = self.map:formvalue(cbid .. ".__hyd")
+		local diag = self.map:formvalue(cbid .. ".__diag") or ""
+		local seen_diag = diag:match("s=1") ~= nil
+		local touched_diag = diag:match("t=1") ~= nil
+
+		-- Map.parse runs Node.parse a second time with novld=true after
+		-- on_after_save. The save-audit has already restored any list that was
+		-- silently cleared during the first pass; letting the second pass run
+		-- the same widget logic with the original form values would undo that
+		-- correction, so managed lists must be a no-op during the re-parse.
+		if novld then
+			return nil
+		end
+
+		local function list_parse_audit(decision, extra)
+			config_audit("列表解析 " .. tostring(self.option)
+				.. " [" .. decision .. "]"
+				.. " hyd=" .. tostring(hyd)
+				.. " values=" .. #values
+				.. " stored=" .. #stored
+				.. " present=" .. tostring(present)
+				.. " diag=" .. tostring(diag)
+				.. " post=" .. dump_post_keys(self.map, cbid)
+				.. (extra or ""))
+		end
 
 		if hyd == "1" then
 			-- The widget owns this list: take its own item list verbatim.
 			values = split_posted_values(self.map:formvalue(cbid .. ".__values"))
+			-- An empty authoritative list with stored values is only trusted
+			-- when the browser confirms it actually displayed the items and
+			-- the user removed them. Otherwise a hydration race or rebuilt
+			-- widget would wipe the configuration.
+			if #values == 0 and #stored > 0 and not (seen_diag and touched_diag) then
+				list_parse_audit("拒信空列表", "，已回退到 stored")
+				return nil
+			end
 			authorized_clear[self.option] = true
 		elseif #values == 0 and #stored > 0 and not present then
-			config_audit("表单未提交 " .. tostring(self.option)
-				.. " 的取值（posted=" .. dump_posted(posted)
-				.. "，stored=" .. #stored
-				.. "，hyd=" .. tostring(hyd)
-				.. "，post=" .. dump_post_keys(self.map, cbid)
-				.. "），已保留原有 " .. #stored .. " 项")
+			list_parse_audit("保留原值")
 			return nil
 		end
 
@@ -767,7 +794,7 @@ local function bind_list_option(option)
 		if type(self.validate) == "function" then
 			local err
 			result, err = self:validate(values, section)
-			if not result and not novld then
+			if not result then
 				self:add_error(section, "invalid", err)
 				return nil
 			end
