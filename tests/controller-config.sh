@@ -96,6 +96,7 @@ assert_contains "${PKG_DIR}/luasrc/view/vnt2/multilist.htm" '__present' "multi v
 assert_not_contains "${PKG_DIR}/luasrc/view/vnt2/multilist.htm" 'name="<%=cbid%>" value=""' "multi value template no longer posts a blank value"
 assert_contains "$MODEL" 'option.__vnt2_managed_parse = true' "list options take over parsing to guard stored values"
 assert_contains "$MODEL" '#values == 0 and not emptied' "empty list posts keep the stored value"
+assert_contains "$MODEL" 'value = self.map:get(section, self.alias or self.option)' "list options read raw UCI values, not cast-truncated ones"
 assert_contains "$MODEL" 'vnt2/multilist' "firewall directions use the list-safe template"
 assert_contains "$MODEL" 'keep_absent_options(w)' "form keeps stored values when a widget is absent from the request"
 assert_contains "$MODEL" 'FEXIST_PREFIX or "cbi.cbe."' "flag widgets are guarded by their existence marker"

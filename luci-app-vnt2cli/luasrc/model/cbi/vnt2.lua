@@ -605,7 +605,16 @@ end
 
 local function bind_list_option(option)
 	option.cfgvalue = function(self, section)
-		local value = AbstractValue.cfgvalue(self, section)
+		-- Read the raw UCI value directly: MultiValue (and any widget whose
+		-- cast is "string") makes AbstractValue.cfgvalue truncate a stored
+		-- list to its first item, which left every firewall direction but the
+		-- first unchecked after each page load.
+		local value
+		if self.tag_error[section] then
+			value = self:formvalue(section)
+		else
+			value = self.map:get(section, self.alias or self.option)
+		end
 		local result = normalized_list_values(value)
 		if #result == 0 then
 			return nil
