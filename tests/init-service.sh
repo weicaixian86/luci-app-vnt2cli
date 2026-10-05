@@ -45,7 +45,8 @@ assert_contains "$INIT" 'client config missing network_code and subscription' "s
 
 # --- single-config export model ---
 assert_contains "$INIT" 'TOML_EXPORT_FILE="/tmp/vnt2cli.toml"' "runtime toml path fixed"
-assert_contains "$INIT" 'export_client_config "$cfg"' "start exports the runtime toml"
+assert_contains "$INIT" 'export_client_config "$cfg"' "service flow exports the runtime toml"
+assert_contains "$INIT" 'client disabled; runtime toml export skipped' "stopped client still refreshes the export"
 assert_contains "$INIT" 'start failed: runtime toml export failed' "export failure blocks client start"
 assert_contains "$INIT" '--conf \"${TOML_EXPORT_FILE}\"' "start passes the exported toml via --conf"
 assert_contains "$INIT" 'client config missing network_code and subscription' "export rejects configs without identity"

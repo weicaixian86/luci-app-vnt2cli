@@ -871,12 +871,14 @@ local function config_audit(message)
 end
 
 function act_toml_read()
-	-- Reload prefers the runtime TOML: the complete config the client
-	-- actually loaded. Fall back to a UCI serialization when the file has
-	-- not been generated yet (client never started).
+	-- Reload prefers the runtime TOML - the complete config the client
+	-- actually loaded - but only while the client is running: when it is
+	-- stopped the file is not regenerated and would go stale, so the always
+	-- current UCI serialization is shown instead.
 	local content = nil
 	local source = "uci"
-	if fs.access(RUNTIME_TOML_FILE) then
+	local pid = get_cli_pid()
+	if pid and fs.access(RUNTIME_TOML_FILE) then
 		local stat = fs.stat(RUNTIME_TOML_FILE)
 		if stat and stat.type == "reg" and (tonumber(stat.size) or 0) > 0 then
 			content = textutil.sanitize_text(fs.readfile(RUNTIME_TOML_FILE) or "")

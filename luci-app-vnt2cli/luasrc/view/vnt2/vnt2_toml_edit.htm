@@ -72,7 +72,7 @@ local toml_save_url = dsp.build_url("admin", "vpn", "vnt2", "toml_save")
 				editor().value = data.content || "";
 				setMessage(data.source === "file"
 					? "已加载运行配置 /tmp/vnt2cli.toml（客户端实际加载的完整配置）"
-					: "运行配置文件尚未生成，已显示当前配置的序列化文本", true);
+					: "客户端未运行或运行配置尚未生成，已显示当前配置的序列化文本", true);
 			} else {
 				setMessage((data && data.error) || "读取配置失败", false);
 			}
