@@ -44,7 +44,6 @@ Release 发布的 `.apk` 由 SDK 自编译构建，未使用官方签名密钥�
 
 ```sh
 apk add --allow-untrusted /tmp/luci-app-vnt2cli_*.apk
-apk info luci-app-vnt2cli
 ```
 
 LuCI 的软件包上传页面不会自动添加 `--allow-untrusted` 参数，APK 请通过 SSH 安装。若后续使用固定签名密钥构建并发布公钥，则可去掉该参数直接安装升级。
@@ -59,7 +58,6 @@ opkg remove luci-app-vnt2cli
 ```
 
 OpenWrt 25.12.x：
-
 ```sh
 apk del luci-app-vnt2cli
 ```
