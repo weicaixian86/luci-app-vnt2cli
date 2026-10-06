@@ -47,7 +47,7 @@ local text_changed_keys = {}
 -- Bumped whenever the save path changes. Every form save logs it, so a report
 -- can be matched against the code that produced it instead of guessing which
 -- build the device is running.
-local FORM_BUILD = "2026-10-05.11"
+local FORM_BUILD = "2026-10-05.12"
 
 -- Audit trail for config mutations: when a populated list gets cleared the
 -- running log records who did it, so silent losses are diagnosable.
@@ -755,6 +755,13 @@ local function bind_list_option(option)
 		-- the same widget logic with the original form values would undo that
 		-- correction, so managed lists must be a no-op during the re-parse.
 		if novld then
+			return nil
+		end
+
+		-- The editor textarea merged this list first (in m.on_parse); the
+		-- rendered form widget still carries the old stored items, so parsing
+		-- it would overwrite the text edit. Skip the form and keep the edit.
+		if text_changed_keys[self.option] then
 			return nil
 		end
 
