@@ -23,6 +23,7 @@ VNT2_FIXED_VERSION="2.0.10"
 GH_PROXY_PREFIX="https://gh-proxy.com/"
 DOWNLOAD_MIRROR_RETRIES=3
 RESTART_PENDING_FILE="/tmp/vnt2-restart.pending"
+LAST_DEVICE_STATE_FILE="/tmp/vnt2-last-device.conf"
 
 VNT2_FORWARD_LIST=""
 NETWORK_SYNC_RESULT=""
@@ -1740,6 +1741,7 @@ cleanup_network() {
 			/sbin/ifdown VNT2 >/dev/null 2>&1 || true
 		fi
 	fi
+	rm -f "${LAST_DEVICE_STATE_FILE}" 2>/dev/null || true
 	uci_delete_if_exists network.VNT2 || return 1
 	uci_delete_if_exists firewall.vnt2zone || return 1
 	uci_delete_if_exists firewall.vnt2fwlan || return 1
@@ -2021,11 +2023,15 @@ sync_network_state() {
 		pending=1
 		if [ -z "$tun_name" ]; then
 			existing_device="$(trim_value "$(uci -q get network.VNT2.device 2>/dev/null || true)")"
-			if [ -n "$existing_device" ]; then
-				tun_name="$existing_device"
-			else
-				tun_name="${mode}0"
-			fi
+			# After a device_mode switch the old network.VNT2.device may still
+			# hold the previous interface name (e.g. tun0 after tun→tap). Only
+			# reuse it when its prefix matches the current mode, otherwise the
+			# pending device name follows the new mode so netifd binds the
+			# correct interface once the restarted client creates it.
+			case "$existing_device" in
+				"${mode}"*) tun_name="$existing_device" ;;
+				*) tun_name="${mode}0" ;;
+			esac
 		fi
 	fi
 
@@ -2276,6 +2282,13 @@ start_cli_instance() {
 
 	ensure_persistent_machine_id || return 1
 
+	# Remember the device configuration that matches the runtime TOML so a
+	# later restart can tell whether the virtual interface itself is changing.
+	local last_mode last_tun
+	config_get last_mode "$cfg" "device_mode" "tun"
+	config_get last_tun "$cfg" "tun_name" ""
+	printf 'old_mode="%s"\nold_tun="%s"\n' "$(trim_value "$last_mode")" "$(trim_value "$last_tun")" >"${LAST_DEVICE_STATE_FILE}" 2>/dev/null || true
+
 	log_service "using ${cli_bin} ctrl=${ctrl_bin} port=${ctrl_port} conf=${TOML_EXPORT_FILE}"
 	procd_open_instance "vnt2_cli"
 	procd_set_param env RUST_LOG="$log_level"
@@ -2322,9 +2335,31 @@ stop_service() {
 	rm -f "${CLI_TIME}"
 	if [ "${VNT2_RESTART_MODE:-}" = "apply" ]; then
 		# Keep the router management path alive while a queued Save & Apply
-		# restart replaces the managed processes. start_service reconciles any
-		# changed network and firewall settings immediately afterwards.
-		log_download 'queued apply restart keeps network and firewall state'
+		# restart replaces the managed processes, unless the virtual network
+		# device itself is changing. A stale tun/tap interface from the old
+		# configuration would otherwise persist and confuse the restarted
+		# client or netifd binding.
+		local old_mode="" old_tun="" new_mode="" new_tun="" cleanup=0 cfg=""
+		if [ -f "${LAST_DEVICE_STATE_FILE}" ]; then
+			. "${LAST_DEVICE_STATE_FILE}"
+		fi
+		config_load "${CONF}"
+		cfg="$(get_first_section_id "vnt2_cli")"
+		if [ -n "$cfg" ]; then
+			config_get new_mode "$cfg" "device_mode" ""
+			config_get new_tun "$cfg" "tun_name" ""
+		fi
+		new_mode="$(trim_value "$new_mode")"
+		new_tun="$(trim_value "$new_tun")"
+		[ -n "$new_mode" ] || new_mode="tun"
+		[ "${old_mode:-tun}" != "$new_mode" ] && cleanup=1
+		[ "${old_tun:-}" != "$new_tun" ] && cleanup=1
+		if [ "$cleanup" -eq 1 ]; then
+			log_download "device changed (${old_mode:-tun}/${old_tun:-*} → ${new_mode}/${new_tun:-*}), cleaning up old interface"
+			cleanup_network
+		else
+			log_download 'queued apply restart keeps network and firewall state'
+		fi
 	else
 		cleanup_network
 	fi
