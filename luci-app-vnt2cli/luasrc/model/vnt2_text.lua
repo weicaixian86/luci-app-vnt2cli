@@ -685,6 +685,7 @@ function M.toml_apply_to_uci(uci, values, do_commit)
 	-- keys whose value actually differs are written; the stored configuration
 	-- is never touched by a save that changes nothing.
 	local applied = 0
+	local changed_keys = {}
 	for _, key in ipairs(TOML_EDIT_KEY_ORDER) do
 		local value = values[key]
 		if value ~= nil then
@@ -693,12 +694,14 @@ function M.toml_apply_to_uci(uci, values, do_commit)
 				if uci:get("vnt2", section, key) ~= want then
 					uci:set("vnt2", section, key, want)
 					applied = applied + 1
+					changed_keys[#changed_keys + 1] = key
 				end
 			elseif TOML_EDIT_NUM_KEYS[key] then
 				local want = tostring(value)
 				if uci:get("vnt2", section, key) ~= want then
 					uci:set("vnt2", section, key, want)
 					applied = applied + 1
+					changed_keys[#changed_keys + 1] = key
 				end
 			elseif TOML_EDIT_LIST_KEYS[key] then
 				local items = {}
@@ -725,6 +728,7 @@ function M.toml_apply_to_uci(uci, values, do_commit)
 						uci:delete("vnt2", section, key)
 						uci:set_list("vnt2", section, key, items)
 						applied = applied + 1
+						changed_keys[#changed_keys + 1] = key
 					end
 				end
 			else
@@ -734,6 +738,7 @@ function M.toml_apply_to_uci(uci, values, do_commit)
 				if s ~= "" and uci:get("vnt2", section, key) ~= s then
 					uci:set("vnt2", section, key, s)
 					applied = applied + 1
+					changed_keys[#changed_keys + 1] = key
 				end
 			end
 		end
@@ -742,7 +747,7 @@ function M.toml_apply_to_uci(uci, values, do_commit)
 	if applied > 0 and do_commit ~= false then
 		uci:commit("vnt2")
 	end
-	return true, applied
+	return true, applied, changed_keys
 end
 
 return M

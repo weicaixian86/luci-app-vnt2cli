@@ -39,10 +39,15 @@ local cbi_options = {}
 local authorized_clear = {}
 local list_options = {}
 
+-- Keys that the editor textarea actually changed during the current form
+-- parse. Form widgets must not overwrite these values, because the rendered
+-- form fields still carry the old UCI values and would undo the edit.
+local text_changed_keys = {}
+
 -- Bumped whenever the save path changes. Every form save logs it, so a report
 -- can be matched against the code that produced it instead of guessing which
 -- build the device is running.
-local FORM_BUILD = "2026-10-05.10"
+local FORM_BUILD = "2026-10-05.11"
 
 -- Audit trail for config mutations: when a populated list gets cleared the
 -- running log records who did it, so silent losses are diagnosable.
@@ -849,6 +854,13 @@ local function keep_absent_options(section)
 			local base = (is_flag and flag_parse) or AbstractValue.parse
 
 			opt.parse = function(self, sect, novld)
+				-- The editor textarea merged this key first; the form field still
+				-- carries the old rendered value, so parsing it would overwrite
+				-- the text edit. Skip it and let the merged value persist.
+				if text_changed_keys[self.option] then
+					return nil
+				end
+
 				-- A widget took part in this request when it posted its value or
 				-- (for flags, which post nothing while unchecked) its existence
 				-- marker. Anything else never reached the browser form.
@@ -1295,11 +1307,16 @@ m.on_after_save = function()
 end
 
 -- The edit-config tab's textarea posts with the form (name=_toml_editor_text).
--- Save its content before the form options parse so the documented order
--- holds: the text config is merged first, the form's own values are applied
--- on top of it. Only text the user actually edited participates - an
--- untouched runtime snapshot must never overwrite the stored configuration.
+-- Save its content before the form options parse. Keys that the text actually
+-- changed are then skipped by the form widgets, because those widgets still
+-- carry the old rendered values and would otherwise overwrite the edit. Only
+-- text the user actually edited participates - an untouched runtime snapshot
+-- must never overwrite the stored configuration.
 m.on_parse = function()
+	-- Reset per-request state. Stale keys from a previous save must not
+	-- cause unrelated form fields to be skipped on this request.
+	text_changed_keys = {}
+
 	-- Snapshot first: the audit compares the state before this request
 	-- against the state the map saved, which is what makes a silent loss
 	-- visible instead of merely suspected.
@@ -1351,10 +1368,15 @@ m.on_parse = function()
 		return
 	end
 
-	local ok, applied = textutil.toml_apply_to_uci(m.uci, values, false)
+	local ok, applied, changed_keys = textutil.toml_apply_to_uci(m.uci, values, false)
 	if not ok then
 		config_audit("编辑配置随表单保存失败：" .. tostring(applied))
 		return
+	end
+	if type(changed_keys) == "table" then
+		for _, key in ipairs(changed_keys) do
+			text_changed_keys[key] = true
+		end
 	end
 	if applied > 0 then
 		config_audit("编辑配置随表单保存：部分合并 " .. tostring(applied)
