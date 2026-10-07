@@ -1,0 +1,2 @@
+config machine_id 'machine_id'
+	option value ''

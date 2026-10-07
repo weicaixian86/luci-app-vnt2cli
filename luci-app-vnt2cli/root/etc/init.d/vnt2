@@ -14,11 +14,20 @@ CLI_TIME="/tmp/vnt2_cli_time"
 TOML_EXPORT_FILE="/tmp/vnt2cli.toml"
 MACHINE_ID_FILE="/etc/machine-id"
 DBUS_MACHINE_ID_FILE="/var/lib/dbus/machine-id"
-# Plugin-owned authoritative copy of the device identity. OpenWrt 25.x may
-# regenerate /etc/machine-id at boot, so we keep our own persistent record and
-# restore it into /etc/machine-id on every start. This keeps the identity stable
-# across reboots even when the OS overwrites /etc/machine-id.
+# Plugin-owned proxy copy of the device identity. OpenWrt 25.x may regenerate
+# /etc/machine-id at boot, so we keep our own record and restore it into
+# /etc/machine-id on every start. This is a proxy consumed by the binary; the
+# authoritative, upgrade-safe store is the UCI config below.
 MACHINE_ID_STORE="/etc/vnt2/machine-id"
+# Authoritative, upgrade-safe store. /etc/config persists across reboots AND
+# sysupgrades on OpenWrt regardless of whether /etc itself is a tmpfs, so the
+# device identity stays stable (9.4.1). A dedicated UCI package keeps this record
+# out of the CBI map, which never touches it.
+MACHINE_ID_UCI_PKG="vnt2-machine-id"
+# Named UCI section. The package ships /etc/config/vnt2-machine-id with this
+# section, and ensure_persistent_machine_id recreates it at runtime if the file
+# is missing, so the read/write paths below always resolve.
+MACHINE_ID_UCI_SEC="machine_id"
 
 DOWNLOAD_CACHE_BASE="/tmp/vnt2-download-cache"
 DOWNLOAD_CLI_STATE="/tmp/vnt2-download-cli.state"
@@ -2182,60 +2191,70 @@ generate_machine_id() {
 }
 
 read_machine_id() {
-	local file="$1" size id
+	local file="$1" id
 
-	# Never read pipes/devices, or an unexpectedly large file, during startup.
+	# Only regular files (following symlinks) are read, so a link to a device or a
+	# directory is rejected rather than blocking startup on garbage. We avoid
+	# stat/dd: busybox stat and dd behave inconsistently across OpenWrt images
+	# (some ship a stat that returns nothing for our files), which previously made
+	# a perfectly valid stored id fail to parse and triggered a spurious
+	# "invalid stored machine-id" refusal on the second boot.
 	[ -f "$file" ] || return 1
-	size="$(stat -L -c '%s' "$file" 2>/dev/null)" || return 1
-	case "$size" in
-		''|*[!0-9]*) return 1 ;;
-	esac
-	[ "$size" -le 128 ] || return 1
-	id="$(dd if="$file" bs=129 count=1 2>/dev/null)" || return 1
+	id="$(cat "$file" 2>/dev/null)" || return 1
 	id="$(trim_value "$id")"
+	[ -n "$id" ] || return 1
+	# Safety bound: device ids are short. Reject anything unexpectedly large so a
+	# stray file cannot flood the id.
+	[ "${#id}" -le 128 ] || return 1
 	valid_machine_id "$id" || return 1
 	printf '%s\n' "$id"
 }
 
 ensure_persistent_machine_id() {
-	local id tmp dbus_id store_dir
+	local id tmp dbus_id store_dir uci_id
 
 	if [ -e "$DBUS_MACHINE_ID_FILE" ] && [ ! -f "$DBUS_MACHINE_ID_FILE" ]; then
 		log_service 'D-Bus machine-id must be a regular file; client startup cancelled'
 		return 1
 	fi
 
-	# 1) Our own authoritative record wins. It is the device identity we chose and
-	#    persisted, so restoring it overrides any machine-id OpenWrt 25.x generates
-	#    at boot and keeps the identity stable across reboots (9.4.1). Only a
-	#    corrupt record of our own triggers a refusal, never an OS-provided file.
-	store_dir="$(dirname "$MACHINE_ID_STORE")"
-	if [ -e "$MACHINE_ID_STORE" ] || [ -L "$MACHINE_ID_STORE" ]; then
-		if [ -f "$MACHINE_ID_STORE" ] && [ ! -L "$MACHINE_ID_STORE" ]; then
-			id="$(read_machine_id "$MACHINE_ID_STORE")" || {
-				log_service 'invalid stored machine-id; refusing to change device identity'
-				return 1
-			}
-		else
-			log_service 'stored machine-id must be a regular file; client startup cancelled'
-			return 1
-		fi
+	# 1) Authoritative record: UCI config. It persists across reboots and
+	#    sysupgrades on OpenWrt regardless of whether /etc itself is a tmpfs, so the
+	#    device identity is stable (9.4.1). A corrupt, non-empty record of our own
+	#    triggers a refusal (9.4.5); an empty/missing one means first run. The
+	#    offending value is logged so a misbehaving device can be diagnosed
+	#    remotely without shell access to the exact file.
+	uci_id="$(trim_value "$(uci -q get "${MACHINE_ID_UCI_PKG}.${MACHINE_ID_UCI_SEC}.value" 2>/dev/null)")"
+	if [ -n "$uci_id" ] && ! valid_machine_id "$uci_id"; then
+		log_service "invalid stored machine-id (uci ${MACHINE_ID_UCI_PKG}.${MACHINE_ID_UCI_SEC}.value='${uci_id}'); refusing to change device identity"
+		return 1
+	fi
+	if valid_machine_id "$uci_id"; then
+		id="$uci_id"
 	else
 		id=""
 	fi
 
-	# 2) First run (no store yet): reuse an existing usable /etc/machine-id so we
-	#    adopt the system identity instead of inventing a new one (9.4.3). OpenWrt
-	#    25.x may have already written one; we accept its form (UUID, 32-hex, ...).
+	# 2) No UCI record yet: adopt an existing usable /etc/machine-id so we reuse
+	#    the system identity instead of inventing a new one (9.4.3). OpenWrt 25.x
+	#    may have already written one; we accept its form (UUID, 32-hex, ...).
 	if ! valid_machine_id "$id"; then
-		if [ -e "$MACHINE_ID_FILE" ] || [ -L "$MACHINE_ID_FILE" ]; then
-			if [ -f "$MACHINE_ID_FILE" ] && [ ! -L "$MACHINE_ID_FILE" ]; then
-				id="$(read_machine_id "$MACHINE_ID_FILE")" || id=""
+		if [ -e "$MACHINE_ID_FILE" ]; then
+			id="$(read_machine_id "$MACHINE_ID_FILE")" || id=""
+			if [ -z "$id" ] && [ -f "$MACHINE_ID_FILE" ]; then
+				log_service 'warning: existing /etc/machine-id present but unreadable; ignoring it'
 			fi
 		fi
 	fi
 
-	# 3) Fall back to the current D-Bus id, then generate a fresh 32-hex id.
+	# 3) Fall back to our own file store (e.g. after a UCI wipe), then the D-Bus
+	#    id, then generate a fresh 32-hex id.
+	if ! valid_machine_id "$id"; then
+		id="$(read_machine_id "$MACHINE_ID_STORE" 2>/dev/null)" || id=""
+		if [ -z "$id" ] && [ -f "$MACHINE_ID_STORE" ]; then
+			log_service 'warning: existing machine-id store present but unreadable; ignoring it'
+		fi
+	fi
 	if ! valid_machine_id "$id"; then
 		id="$(read_machine_id "$DBUS_MACHINE_ID_FILE" 2>/dev/null)" || id=""
 	fi
@@ -2247,8 +2266,21 @@ ensure_persistent_machine_id() {
 		}
 	fi
 
-	# 4) Persist our authoritative copy atomically so reboots restore the same id
-	#    even if OpenWrt overwrites /etc/machine-id.
+	# 4) Persist the chosen identity. UCI is authoritative; the file store is a
+	#    proxy for the binary and any tool that reads /etc/vnt2/machine-id.
+	#    The named section is recreated first if the shipped config file is
+	#    missing (e.g. after a partial upgrade), otherwise the option write
+	#    would fail silently and UCI could never persist the id.
+	if [ "$id" != "$uci_id" ]; then
+		if [ -z "$(uci -q get "${MACHINE_ID_UCI_PKG}.${MACHINE_ID_UCI_SEC}" 2>/dev/null)" ]; then
+			uci -q set "${MACHINE_ID_UCI_PKG}.${MACHINE_ID_UCI_SEC}=${MACHINE_ID_UCI_SEC}" 2>/dev/null
+		fi
+		uci -q set "${MACHINE_ID_UCI_PKG}.${MACHINE_ID_UCI_SEC}.value=$id" 2>/dev/null
+		uci -q commit "${MACHINE_ID_UCI_PKG}" 2>/dev/null ||
+			log_service 'failed to persist machine-id to UCI'
+	fi
+
+	store_dir="$(dirname "$MACHINE_ID_STORE")"
 	if ! mkdir -p "$store_dir"; then
 		log_service 'failed to create machine-id store directory'
 		return 1
@@ -2265,8 +2297,8 @@ ensure_persistent_machine_id() {
 	fi
 
 	# 5) Install the id into /etc/machine-id as a regular file. If it is a symlink
-	#    we remove it first so the regular file can take its place, then overwrite
-	#    only when the content differs to avoid needless churn.
+	#    OpenWrt placed there, we remove it so the regular file can take its place,
+	#    then overwrite only when the content differs to avoid needless churn.
 	if [ -L "$MACHINE_ID_FILE" ]; then
 		rm -f "$MACHINE_ID_FILE"
 	fi
