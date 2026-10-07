@@ -8,20 +8,31 @@ for value in util.imatch(self:cfgvalue(section) or self.default) do
 end
 %>
 <%
--- Presence marker rendered outside the widget placeholder: hydration replaces
--- the placeholder below, this marker survives it. Together with the fallback
--- inputs inside the placeholder it separates "the user unchecked every
--- direction" (marker posted, no values) from "the widget never took part in
--- the request" (nothing posted at all), which would otherwise wipe the stored
--- selection.
-%><input type="hidden" name="<%=cbid%>.__present" value="1" /><%
--- Stored mirror, outside the placeholder so hydration cannot remove it.
-for _, _v in ipairs(values) do
+-- Clearing guard for multi-value lists (firewall directions).
+--
+-- The widget below starts life as a data-ui-widget placeholder; cbi.js
+-- replaces that node with the real select/checkbox group after load. An empty
+-- post is therefore ambiguous:
+--   * the user unchecked every direction -> the list must be cleared
+--   * the widget never rendered them       -> the stored list must survive
+--
+-- We mirror the stored values into __stored inputs OUTSIDE the placeholder so
+-- hydration can never remove them, and the placeholder also keeps fallback
+-- inputs (name=<cbid>) that post the rendered values when hydration never ran.
+-- The "widget took over" signal is posted ONLY when the widget actually
+-- hydrated: a broken hydration therefore posts nothing and the server keeps
+-- the stored selection instead of wiping it. This mirrors the DynamicList
+-- guard (dynlist.htm) so both list kinds behave identically across LuCI
+-- versions (24.10 / 25.x).
+%><div class="vnt2-multi" data-cbid="<%=cbid%>">
+<input type="hidden" data-vnt2-values name="<%=cbid%>.__values" value="" />
+<input type="hidden" data-vnt2-diag name="<%=cbid%>.__diag" value="" />
+<% for _, _v in ipairs(values) do
 	if _v and _v ~= "" then
 %><input type="hidden" name="<%=cbid%>.__stored" value="<%=pcdata(_v)%>" /><%
 	end
-end
-%><div<%=attr("data-ui-widget", luci.util.serialize_json({
+end %>
+<div<%=attr("data-ui-widget", luci.util.serialize_json({
 	"Select", values, self:choices(), {
 		id = cbid,
 		name = cbid,
@@ -43,4 +54,92 @@ for _, _v in ipairs(values) do
 	end
 end
 %></div>
+</div>
+<script type="text/javascript">(function() {
+	window.vnt2MultiSync = function(submitting) {
+		var hosts = document.querySelectorAll('.vnt2-multi'), i;
+		for (i = 0; i < hosts.length; i++) {
+			var host = hosts[i];
+			var cbid = host.getAttribute('data-cbid');
+			var ph = host.querySelector('div[data-ui-widget]');
+			// cbi.js replaces the placeholder node with the rendered widget.
+			// A detached placeholder is the hydration signal.
+			var hydrated = ph ? !(ph.isConnected === true || document.documentElement.contains(ph)) : false;
+
+			// Read the currently selected directions straight from the DOM.
+			// This works whether the widget rendered as checkboxes (name=cbid,
+			// each checked) or a <select multiple> (option:checked), and does
+			// not depend on a specific LuCI version's widget internals.
+			var vals = [];
+			if (cbid) {
+				var boxes = host.querySelectorAll('input[name="' + cbid + '"]');
+				for (var n = 0; n < boxes.length; n++) {
+					if (boxes[n].checked) {
+						vals.push(boxes[n].value);
+					}
+				}
+				var opts = host.querySelectorAll('select[name="' + cbid + '"] option:checked');
+				for (var s = 0; s < opts.length; s++) {
+					vals.push(opts[s].value);
+				}
+			}
+
+			if (!submitting) {
+				continue;
+			}
+
+			var out = host.querySelector('input[data-vnt2-values]');
+			var diag = host.querySelector('input[data-vnt2-diag]');
+			if (!out) {
+				continue;
+			}
+
+			// Post the "widget took over" marker only when it really hydrated.
+			// A widget that never rendered (hydration error / race) leaves no
+			// marker, so the server keeps the stored list instead of clearing.
+			var present = host.querySelector('input[data-vnt2-present]');
+			if (hydrated) {
+				if (!present) {
+					present = document.createElement('input');
+					present.type = 'hidden';
+					present.name = cbid + '.__present';
+					present.setAttribute('data-vnt2-present', '');
+					host.appendChild(present);
+				}
+				present.value = '1';
+			} else if (present) {
+				present.parentNode.removeChild(present);
+			}
+
+			out.value = vals.join('\n');
+			if (diag) {
+				diag.value = 'h=' + (hydrated ? '1' : '0') + '&v=' + vals.length;
+			}
+		}
+	};
+
+	if (!window.vnt2MultiGuard) {
+		window.vnt2MultiGuard = true;
+		// Save & Apply may call form.submit() directly and skip the submit
+		// event's capture phase, so also sync on every change.
+		document.addEventListener('submit', function() {
+			window.vnt2MultiSync(true);
+		}, true);
+		document.addEventListener('change', function(ev) {
+			if (ev.target && ev.target.closest && ev.target.closest('.vnt2-multi')) {
+				window.vnt2MultiSync(true);
+			}
+		});
+		window.addEventListener('load', function() {
+			window.vnt2MultiSync(false);
+		});
+		[300, 1500, 4000].forEach(function(d) {
+			window.setTimeout(function() {
+				window.vnt2MultiSync(false);
+			}, d);
+		});
+	}
+
+	window.vnt2MultiSync(false);
+})();</script>
 <%+cbi/valuefooter%>
