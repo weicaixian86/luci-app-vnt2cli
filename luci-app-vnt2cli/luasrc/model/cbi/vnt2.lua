@@ -47,7 +47,7 @@ local text_changed_keys = {}
 -- Bumped whenever the save path changes. Every form save logs it, so a report
 -- can be matched against the code that produced it instead of guessing which
 -- build the device is running.
-local FORM_BUILD = "2026-10-05.15"
+local FORM_BUILD = "2026-10-05.16"
 
 -- Audit trail for config mutations: when a populated list gets cleared the
 -- running log records who did it, so silent losses are diagnosable.
@@ -853,10 +853,20 @@ local function keep_absent_options(section)
 			and name ~= "upload_cli" and name ~= "_toml_edit" and name ~= "_upload_note_cli" then
 			-- Flags carry their own parse (existence marker based); every other
 			-- widget inherits AbstractValue.parse.
-			local is_flag = opt.template == "cbi/fvalue"
-			local base = (is_flag and flag_parse) or AbstractValue.parse
+		local is_flag = opt.template == "cbi/fvalue"
+		local base = (is_flag and flag_parse) or AbstractValue.parse
 
-			opt.parse = function(self, sect, novld)
+		-- FR1.2: a user who explicitly empties a plain field (clears the text,
+		-- or empties a select/list) must have that parameter cleared in UCI.
+		-- LuCI's default rmempty keeps the old value on an empty submission, so
+		-- mark these fields optional: an empty post then removes the stored
+		-- option instead of silently preserving it. Flags carry their own
+		-- existence-marker (cbi.cbe) semantics and are left untouched.
+		if not is_flag then
+			opt.optional = true
+		end
+
+		opt.parse = function(self, sect, novld)
 				-- The editor textarea merged this key first; the form field still
 				-- carries the old rendered value, so parsing it would overwrite
 				-- the text edit. Skip it and let the merged value persist.
