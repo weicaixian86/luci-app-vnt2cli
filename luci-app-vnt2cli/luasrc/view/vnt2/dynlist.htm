@@ -4,19 +4,22 @@
 --
 -- The widget below starts life as a data-ui-widget placeholder; cbi.js
 -- replaces that node with the real widget after the page has loaded, and the
--- values then live in hidden inputs the widget creates client side. An empty
--- post is therefore ambiguous:
+-- values then live inside the widget (a LuCI DynamicList). An empty post is
+-- therefore ambiguous:
 --   * the user removed the last item  -> the list must be cleared
 --   * the widget never rendered them  -> the stored list must survive
 --
--- Only the browser can tell those apart, so it reports the widget's own item
--- list when the form is submitted:
---   * __hyd    "1"  - the widget took over and __values is authoritative
---   * __values      - the widget's items, one per line (empty = all removed)
---   * __diag        - s=<seen>&t=<touched>, browser side state for the server
--- The stored values are mirrored into __stored inputs outside the placeholder,
--- so hydration can never remove them; the server falls back to them whenever
--- the widget did not take over.
+-- Only the browser can tell those apart, so on submit it reports:
+--   * __hyd     "1"  - the widget took over; __values is authoritative
+--   * __values       - the widget's items, one per line (empty = all removed)
+--   * __diag          - h=<hydrated>&v=<count>&s=<stored>&t=<touched>
+--
+-- Crucially, the stored values are mirrored into __stored inputs that live
+-- OUTSIDE the widget placeholder. They are used only for the client-side
+-- self-heal and the stored-count check; they are NEVER posted as the option
+-- value (there is no name="<cbid>" input here). A previous build posted the
+-- stored values as name="<cbid>" fallbacks, which meant deleting every item
+-- still submitted the old values and the server could never clear the list.
 %><div class="vnt2-dynlist" data-cbid="<%=cbid%>"><input type="hidden" data-vnt2-hyd name="<%=cbid%>.__hyd" value="" /><input type="hidden" data-vnt2-values name="<%=cbid%>.__values" value="" /><input type="hidden" data-vnt2-diag name="<%=cbid%>.__diag" value="" /><%
 local _vals = self:cfgvalue(section)
 if type(_vals) == "table" then
@@ -35,18 +38,7 @@ end
 		optional = self.optional or self.rmempty,
 		placeholder = self.placeholder
 	}
-}))%>><%
--- Fallback values inside the placeholder: they post the rendered values while
--- the widget has not been hydrated yet, which covers a submit that races
--- hydration. Successful hydration replaces this div with the real widget.
-if type(_vals) == "table" then
-	for _, _v in ipairs(_vals) do
-		if _v and _v ~= "" then
-%><input type="hidden" name="<%=cbid%>" value="<%=pcdata(_v)%>" /><%
-		end
-	end
-end
-%></div>
+}))%>></div>
 </div>
 <script type="text/javascript">(function() {
 	if (!window.vnt2DynlistGuard) {
@@ -133,26 +125,35 @@ end
 				}
 
 				var storedCount = host.querySelectorAll('input[name$=".__stored"]').length;
+				var touched = (host.getAttribute('data-touched') === '1');
 
-				// A hydrated widget is authoritative: getValue() returns exactly
-				// what the user sees. An empty hydrated widget is trusted only
-				// when there was nothing stored to lose, otherwise a hydration
-				// race would wipe the configuration.
+				// A hydrated widget is authoritative. An empty result is
+				// trusted too - but only once the user actually touched the
+				// widget (an add or remove dispatches cbi-dynlist-change). An
+				// empty widget the user never touched is a hydration race and
+				// must keep the stored values rather than wipe them.
 				var authoritative = hydrated && widget &&
-					(values.length > 0 || storedCount === 0);
+					(values.length > 0 || touched);
 				hyd.value = authoritative ? '1' : '0';
 				out.value = values.join('\n');
 				if (diag) {
 					diag.value = 'h=' + (hydrated ? '1' : '0') +
-						'&v=' + values.length + '&s=' + storedCount;
+						'&v=' + values.length +
+						'&s=' + storedCount +
+						'&t=' + (touched ? '1' : '0');
 				}
 			}
 		};
 
-		// Keep the hidden inputs up-to-date on every widget change so a later
-		// Save & Apply (which may call form.submit() directly) still posts the
-		// current item list.
+		// Any user add/remove marks the widget touched, so an empty result on
+		// submit is trusted as a deliberate clear instead of a hydration race.
 		document.addEventListener('cbi-dynlist-change', function(ev) {
+			var hosts = document.querySelectorAll('.vnt2-dynlist'), i;
+			for (i = 0; i < hosts.length; i++) {
+				if (hosts[i].contains(ev.target)) {
+					hosts[i].setAttribute('data-touched', '1');
+				}
+			}
 			window.vnt2DynlistSync(true);
 		});
 
