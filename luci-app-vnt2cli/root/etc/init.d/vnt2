@@ -11,6 +11,16 @@ DOWNLOAD_LOG="/tmp/vnt2-download.log"
 
 CLI_TIME="/tmp/vnt2_cli_time"
 
+# vnt2_cli (Rust/log4rs) writes its own file log to /tmp/logs/vnt2.log via a
+# log4rs config it generates on first run. Its default timestamp pattern is
+# RFC3339 with nanosecond precision and a zone offset
+# (2026-10-07T19:19:15.844466001+08:00), which clashes with the plugin's own
+# "YYYY-MM-DD HH:MM:SS" service/download log style and makes the merged runtime
+# log visually inconsistent. log_init0() only writes logs/log4rs.yaml when it is
+# absent, so we pre-create it with a local-time, second-precision pattern so the
+# client log adopts the same format as the plugin logs.
+CLIENT_LOG4RS_CONF="/tmp/logs/log4rs.yaml"
+
 TOML_EXPORT_FILE="/tmp/vnt2cli.toml"
 MACHINE_ID_FILE="/etc/machine-id"
 DBUS_MACHINE_ID_FILE="/var/lib/dbus/machine-id"
@@ -65,6 +75,48 @@ log_download() {
 
 ensure_log_files() {
 	[ -f "${DOWNLOAD_LOG}" ] || : >"${DOWNLOAD_LOG}"
+}
+
+# Seed /tmp/logs/log4rs.yaml so vnt2_cli emits the plugin's local-time,
+# second-precision timestamp ("YYYY-MM-DD HH:MM:SS") instead of the log4rs
+# default RFC3339-with-nanoseconds form. The binary only generates this file
+# when it is missing, so writing it here takes effect on the next start. The
+# pattern mirrors the binary's own default exactly, changing only {d} -> a
+# strftime date format; everything else (file path, rotation, level) is kept
+# identical so runtime behaviour is unchanged.
+ensure_client_log_config() {
+	mkdir -p /tmp/logs 2>/dev/null || return 0
+	local tmp="${CLIENT_LOG4RS_CONF}.$$"
+	cat >"${tmp}" <<'EOF'
+refresh_rate: 30 seconds
+appenders:
+  rolling_file:
+    kind: rolling_file
+    path: logs/vnt2.log
+    append: true
+    encoder:
+      pattern: "{d(%Y-%m-%d %H:%M:%S)} [{f}:{L}] {h({l})} {M}:{m}{n}"
+    policy:
+      kind: compound
+      trigger:
+        kind: size
+        limit: 10 mb
+      roller:
+        kind: fixed_window
+        pattern: logs/vnt2.{}.log
+        base: 1
+        count: 5
+  console:
+    kind: console
+    encoder:
+      pattern: "{d(%Y-%m-%d %H:%M:%S)} {h({l})} {m}{n}"
+root:
+  level: info
+  appenders:
+    - rolling_file
+    - console
+EOF
+	mv -f "${tmp}" "${CLIENT_LOG4RS_CONF}" 2>/dev/null || rm -f "${tmp}"
 }
 
 get_first_section_id() {
@@ -2407,6 +2459,7 @@ start_cli_instance() {
 	printf 'old_mode="%s"\nold_tun="%s"\n' "$(trim_value "$last_mode")" "$(trim_value "$last_tun")" >"${LAST_DEVICE_STATE_FILE}" 2>/dev/null || true
 
 	log_service "using ${cli_bin} ctrl=${ctrl_bin} port=${ctrl_port} conf=${TOML_EXPORT_FILE}"
+	ensure_client_log_config
 	procd_open_instance "vnt2_cli"
 	procd_set_param env RUST_LOG="$log_level"
 	procd_set_param command /bin/sh -c "cd /tmp && exec \"${cli_bin}\" --conf \"${TOML_EXPORT_FILE}\" --ctrl-port \"${ctrl_port}\""
