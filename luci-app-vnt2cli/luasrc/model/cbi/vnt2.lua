@@ -47,7 +47,7 @@ local text_changed_keys = {}
 -- Bumped whenever the save path changes. Every form save logs it, so a report
 -- can be matched against the code that produced it instead of guessing which
 -- build the device is running.
-local FORM_BUILD = "2026-10-05.12"
+local FORM_BUILD = "2026-10-05.13"
 
 -- Audit trail for config mutations: when a populated list gets cleared the
 -- running log records who did it, so silent losses are diagnosable.
@@ -746,8 +746,6 @@ local function bind_list_option(option)
 		local present = self.map:formvalue(cbid .. ".__present") ~= nil
 		local hyd = self.map:formvalue(cbid .. ".__hyd")
 		local diag = self.map:formvalue(cbid .. ".__diag") or ""
-		local seen_diag = diag:match("s=1") ~= nil
-		local touched_diag = diag:match("t=1") ~= nil
 
 		-- Map.parse runs Node.parse a second time with novld=true after
 		-- on_after_save. The save-audit has already restored any list that was
@@ -755,13 +753,6 @@ local function bind_list_option(option)
 		-- the same widget logic with the original form values would undo that
 		-- correction, so managed lists must be a no-op during the re-parse.
 		if novld then
-			return nil
-		end
-
-		-- The editor textarea merged this list first (in m.on_parse); the
-		-- rendered form widget still carries the old stored items, so parsing
-		-- it would overwrite the text edit. Skip the form and keep the edit.
-		if text_changed_keys[self.option] then
 			return nil
 		end
 
@@ -777,17 +768,20 @@ local function bind_list_option(option)
 				.. (extra or ""))
 		end
 
+		-- The editor textarea merged this list first (in m.on_parse); the
+		-- rendered form widget still carries the old stored items, so parsing
+		-- it would overwrite the text edit. Skip the form and keep the edit.
+		if text_changed_keys[self.option] then
+			list_parse_audit("文本已改跳过", "，保留编辑配置的值")
+			return nil
+		end
+
 		if hyd == "1" then
-			-- The widget owns this list: take its own item list verbatim.
+			-- The widget has hydrated and is authoritative: use its own item
+			-- list verbatim. Empty authoritative lists are allowed because the
+			-- JS only sets hyd=1 when the widget really took over.
 			values = split_posted_values(self.map:formvalue(cbid .. ".__values"))
-			-- An empty authoritative list with stored values is only trusted
-			-- when the browser confirms it actually displayed the items and
-			-- the user removed them. Otherwise a hydration race or rebuilt
-			-- widget would wipe the configuration.
-			if #values == 0 and #stored > 0 and not (seen_diag and touched_diag) then
-				list_parse_audit("拒信空列表", "，已回退到 stored")
-				return nil
-			end
+			list_parse_audit("widget 接管", "，使用 __values=" .. #values)
 			authorized_clear[self.option] = true
 		elseif #values == 0 and #stored > 0 and not present then
 			list_parse_audit("保留原值")
@@ -822,10 +816,12 @@ local function bind_list_option(option)
 			if not same_list(current, result) then
 				self:write(section, result)
 				self.section.changed = true
+				list_parse_audit("写入", "，新值=" .. dump_posted(result))
 			end
 		elseif #current > 0 then
 			self:remove(section)
 			self.section.changed = true
+			list_parse_audit("删除", "，清空原 " .. #current .. " 项")
 		end
 	end
 end

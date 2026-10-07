@@ -2144,6 +2144,29 @@ valid_machine_id() {
 	[ "${#1}" -eq 32 ] && [ "$1" != "00000000000000000000000000000000" ]
 }
 
+# OpenWrt/iStoreOS images vary in which utilities they ship. Try several
+# ways to produce 32 hex characters so a missing od/hextool never blocks
+# the client from starting.
+generate_machine_id() {
+	local id
+
+	id="$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d '[:space:]')"
+	valid_machine_id "$id" && { echo "$id"; return 0; }
+
+	id="$(hexdump -n16 -e '/1 "%02x"' /dev/urandom 2>/dev/null)"
+	valid_machine_id "$id" && { echo "$id"; return 0; }
+
+	id="$(dd if=/dev/urandom bs=16 count=1 2>/dev/null | hexdump -ve '1/1 "%02x"')"
+	valid_machine_id "$id" && { echo "$id"; return 0; }
+
+	if command -v openssl >/dev/null 2>&1; then
+		id="$(openssl rand -hex 16 2>/dev/null)"
+		valid_machine_id "$id" && { echo "$id"; return 0; }
+	fi
+
+	return 1
+}
+
 read_machine_id() {
 	local file="$1" size id
 
@@ -2182,7 +2205,7 @@ ensure_persistent_machine_id() {
 	else
 		id="$(read_machine_id "$DBUS_MACHINE_ID_FILE" 2>/dev/null)" || id=""
 		if ! valid_machine_id "$id"; then
-			id="$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d '[:space:]')"
+			id="$(generate_machine_id)"
 			valid_machine_id "$id" || {
 				log_service 'failed to generate persistent machine-id'
 				return 1

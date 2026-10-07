@@ -83,10 +83,9 @@ end
 		};
 
 		window.vnt2DynlistSync = function(submitting) {
-			var hosts = document.querySelectorAll('.vnt2-dynlist'), i, j;
+			var hosts = document.querySelectorAll('.vnt2-dynlist'), i;
 			for (i = 0; i < hosts.length; i++) {
 				var host = hosts[i];
-				var cbid = host.getAttribute('data-cbid') || '';
 				var ph = host.vnt2Placeholder;
 				if (ph === undefined) {
 					ph = host.querySelector('div[data-ui-widget]');
@@ -96,27 +95,31 @@ end
 				// cbi.js replaces the placeholder node with the rendered
 				// widget. The detached node is the only reliable hydration
 				// signal; class names and markup belong to the widget.
-				var hydrated = true;
+				var hydrated = false;
 				if (ph) {
 					hydrated = !(ph.isConnected === true || document.documentElement.contains(ph));
 				}
 
 				var widget = host.querySelector('.cbi-dynlist');
-				var inputs = host.querySelectorAll('input[name="' + cbid + '"]');
 				var values = [];
-				for (j = 0; j < inputs.length; j++) {
-					var v = (inputs[j].value || '').replace(/^\s+|\s+$/g, '');
-					if (v !== '') {
-						values.push(v);
-					}
-				}
-				if (values.length > 0) {
-					host.setAttribute('data-seen', '1');
-					host.setAttribute('data-armed', '1');
+
+				// Ask the LuCI widget itself for its current items. This avoids
+				// relying on input names or DOM internals that differ between
+				// LuCI versions or themes.
+				if (hydrated && widget && window.L && L.dom &&
+				    typeof L.dom.callClassMethod === 'function') {
+					try {
+						var raw = L.dom.callClassMethod(widget, 'getValue');
+						if (Array.isArray(raw)) {
+							values = raw;
+						} else if (raw != null && raw !== '') {
+							values = [String(raw)];
+						}
+					} catch (e) {}
 				}
 
 				if (!submitting) {
-					if (hydrated && widget) {
+					if (hydrated && widget && values.length === 0) {
 						window.vnt2DynlistRepair(host, widget);
 					}
 					continue;
@@ -130,34 +133,27 @@ end
 				}
 
 				var storedCount = host.querySelectorAll('input[name$=".__stored"]').length;
-				var seen = (host.getAttribute('data-seen') === '1');
-				var touched = (host.getAttribute('data-touched') === '1');
 
-				// An empty widget is only trusted when it really displayed the
-				// stored items and then lost them through a user action. A
-				// widget that never showed an item - a hydration race or a
-				// rebuild - must never wipe the stored configuration, so it
-				// reports "not authoritative" and the server keeps the values.
-				var authoritative = hydrated &&
-					(values.length > 0 || storedCount === 0 || (seen && touched));
+				// A hydrated widget is authoritative: getValue() returns exactly
+				// what the user sees. An empty hydrated widget is trusted only
+				// when there was nothing stored to lose, otherwise a hydration
+				// race would wipe the configuration.
+				var authoritative = hydrated && widget &&
+					(values.length > 0 || storedCount === 0);
 				hyd.value = authoritative ? '1' : '0';
 				out.value = values.join('\n');
 				if (diag) {
-					diag.value = 's=' + (seen ? '1' : '0') + '&t=' + (touched ? '1' : '0');
+					diag.value = 'h=' + (hydrated ? '1' : '0') +
+						'&v=' + values.length + '&s=' + storedCount;
 				}
 			}
 		};
 
-		// Only an armed host (one that was really seen holding its values)
-		// may treat a later removal as the user's own change.
+		// Keep the hidden inputs up-to-date on every widget change so a later
+		// Save & Apply (which may call form.submit() directly) still posts the
+		// current item list.
 		document.addEventListener('cbi-dynlist-change', function(ev) {
-			var hosts = document.querySelectorAll('.vnt2-dynlist[data-armed="1"]'), i;
-			for (i = 0; i < hosts.length; i++) {
-				if (hosts[i].contains(ev.target)) {
-					hosts[i].setAttribute('data-touched', '1');
-				}
-			}
-			window.vnt2DynlistSync(false);
+			window.vnt2DynlistSync(true);
 		});
 
 		document.addEventListener('submit', function() {
