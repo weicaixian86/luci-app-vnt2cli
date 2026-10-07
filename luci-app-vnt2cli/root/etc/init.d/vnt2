@@ -14,6 +14,11 @@ CLI_TIME="/tmp/vnt2_cli_time"
 TOML_EXPORT_FILE="/tmp/vnt2cli.toml"
 MACHINE_ID_FILE="/etc/machine-id"
 DBUS_MACHINE_ID_FILE="/var/lib/dbus/machine-id"
+# Plugin-owned authoritative copy of the device identity. OpenWrt 25.x may
+# regenerate /etc/machine-id at boot, so we keep our own persistent record and
+# restore it into /etc/machine-id on every start. This keeps the identity stable
+# across reboots even when the OS overwrites /etc/machine-id.
+MACHINE_ID_STORE="/etc/vnt2/machine-id"
 
 DOWNLOAD_CACHE_BASE="/tmp/vnt2-download-cache"
 DOWNLOAD_CLI_STATE="/tmp/vnt2-download-cli.state"
@@ -2138,10 +2143,19 @@ append_forward_items_from_string() {
 }
 
 valid_machine_id() {
+	# The fixed upstream binary resolves its device identity through machine_uid,
+	# which accepts any non-empty, printable machine-id: a 32-hex id, a UUID, or
+	# another distribution-specific form. We accept the same shape and only reject
+	# content that cannot serve as a device identity: empty/whitespace, control
+	# characters, or the all-zero "uninitialized" sentinel that some systems write
+	# before entropy is available. This also lets us reuse an OpenWrt-provided
+	# /etc/machine-id instead of refusing to start because it is not 32 hex.
+	[ -n "$1" ] || return 1
 	case "$1" in
-		''|*[!0-9a-fA-F]*) return 1 ;;
+		*[[:space:]]*) return 1 ;;
 	esac
-	[ "${#1}" -eq 32 ] && [ "$1" != "00000000000000000000000000000000" ]
+	[ "$1" != "00000000000000000000000000000000" ] || return 1
+	[ "${#1}" -ge 8 ] && [ "${#1}" -le 64 ]
 }
 
 # OpenWrt/iStoreOS images vary in which utilities they ship. Try several
@@ -2184,33 +2198,80 @@ read_machine_id() {
 }
 
 ensure_persistent_machine_id() {
-	local id tmp dbus_id
+	local id tmp dbus_id store_dir
 
 	if [ -e "$DBUS_MACHINE_ID_FILE" ] && [ ! -f "$DBUS_MACHINE_ID_FILE" ]; then
 		log_service 'D-Bus machine-id must be a regular file; client startup cancelled'
 		return 1
 	fi
 
-	# The fixed upstream binary resolves its device identity from these files.
-	# OpenWrt puts /var in /tmp, so both paths must use the persistent ID.
-	if [ -e "$MACHINE_ID_FILE" ] || [ -L "$MACHINE_ID_FILE" ]; then
-		[ -f "$MACHINE_ID_FILE" ] && [ ! -L "$MACHINE_ID_FILE" ] || {
-			log_service 'persistent machine-id must be a regular file'
-			return 1
-		}
-		id="$(read_machine_id "$MACHINE_ID_FILE")" || {
-			log_service 'invalid persistent machine-id; refusing to change device identity'
-			return 1
-		}
-	else
-		id="$(read_machine_id "$DBUS_MACHINE_ID_FILE" 2>/dev/null)" || id=""
-		if ! valid_machine_id "$id"; then
-			id="$(generate_machine_id)"
-			valid_machine_id "$id" || {
-				log_service 'failed to generate persistent machine-id'
+	# 1) Our own authoritative record wins. It is the device identity we chose and
+	#    persisted, so restoring it overrides any machine-id OpenWrt 25.x generates
+	#    at boot and keeps the identity stable across reboots (9.4.1). Only a
+	#    corrupt record of our own triggers a refusal, never an OS-provided file.
+	store_dir="$(dirname "$MACHINE_ID_STORE")"
+	if [ -e "$MACHINE_ID_STORE" ] || [ -L "$MACHINE_ID_STORE" ]; then
+		if [ -f "$MACHINE_ID_STORE" ] && [ ! -L "$MACHINE_ID_STORE" ]; then
+			id="$(read_machine_id "$MACHINE_ID_STORE")" || {
+				log_service 'invalid stored machine-id; refusing to change device identity'
 				return 1
 			}
+		else
+			log_service 'stored machine-id must be a regular file; client startup cancelled'
+			return 1
 		fi
+	else
+		id=""
+	fi
+
+	# 2) First run (no store yet): reuse an existing usable /etc/machine-id so we
+	#    adopt the system identity instead of inventing a new one (9.4.3). OpenWrt
+	#    25.x may have already written one; we accept its form (UUID, 32-hex, ...).
+	if ! valid_machine_id "$id"; then
+		if [ -e "$MACHINE_ID_FILE" ] || [ -L "$MACHINE_ID_FILE" ]; then
+			if [ -f "$MACHINE_ID_FILE" ] && [ ! -L "$MACHINE_ID_FILE" ]; then
+				id="$(read_machine_id "$MACHINE_ID_FILE")" || id=""
+			fi
+		fi
+	fi
+
+	# 3) Fall back to the current D-Bus id, then generate a fresh 32-hex id.
+	if ! valid_machine_id "$id"; then
+		id="$(read_machine_id "$DBUS_MACHINE_ID_FILE" 2>/dev/null)" || id=""
+	fi
+	if ! valid_machine_id "$id"; then
+		id="$(generate_machine_id)"
+		valid_machine_id "$id" || {
+			log_service 'failed to generate persistent machine-id'
+			return 1
+		}
+	fi
+
+	# 4) Persist our authoritative copy atomically so reboots restore the same id
+	#    even if OpenWrt overwrites /etc/machine-id.
+	if ! mkdir -p "$store_dir"; then
+		log_service 'failed to create machine-id store directory'
+		return 1
+	fi
+	tmp="$(mktemp "${MACHINE_ID_STORE}.XXXXXX")" || {
+		log_service 'failed to create machine-id store temporary file'
+		return 1
+	}
+	if ! printf '%s\n' "$id" >"$tmp" ||
+		! chmod 444 "$tmp" || ! mv -f "$tmp" "$MACHINE_ID_STORE"; then
+		rm -f "$tmp"
+		log_service 'failed to persist machine-id store; client startup cancelled'
+		return 1
+	fi
+
+	# 5) Install the id into /etc/machine-id as a regular file. If it is a symlink
+	#    we remove it first so the regular file can take its place, then overwrite
+	#    only when the content differs to avoid needless churn.
+	if [ -L "$MACHINE_ID_FILE" ]; then
+		rm -f "$MACHINE_ID_FILE"
+	fi
+	if [ ! -f "$MACHINE_ID_FILE" ] ||
+		[ "$(read_machine_id "$MACHINE_ID_FILE" 2>/dev/null)" != "$id" ]; then
 		tmp="$(mktemp "${MACHINE_ID_FILE}.XXXXXX")" || {
 			log_service 'failed to create persistent machine-id temporary file'
 			return 1
@@ -2224,6 +2285,7 @@ ensure_persistent_machine_id() {
 		log_service 'saved machine-id for automatic device identity across reboots'
 	fi
 
+	# 6) Keep D-Bus pointed at our persistent id (9.4.4).
 	dbus_id="$(read_machine_id "$DBUS_MACHINE_ID_FILE" 2>/dev/null)" || dbus_id=""
 	if [ "$dbus_id" != "$id" ]; then
 		log_service 'restoring persistent machine-id for automatic device identity'

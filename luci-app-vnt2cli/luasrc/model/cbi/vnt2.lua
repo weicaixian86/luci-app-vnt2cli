@@ -47,7 +47,7 @@ local text_changed_keys = {}
 -- Bumped whenever the save path changes. Every form save logs it, so a report
 -- can be matched against the code that produced it instead of guessing which
 -- build the device is running.
-local FORM_BUILD = "2026-10-05.16"
+local FORM_BUILD = "2026-10-07.1"
 
 -- Audit trail for config mutations: when a populated list gets cleared the
 -- running log records who did it, so silent losses are diagnosable.
@@ -460,7 +460,7 @@ local function is_domain(value)
 	return not value:match("^%.") and not value:match("%.$")
 end
 
-local function validate_cidr(self, value)
+local function validate_cidr(value)
 	value = trim(value)
 	if value == "" then
 		return value
@@ -484,7 +484,7 @@ local function ipv4_network_key(value)
 end
 
 local function is_ipv4_or_cidr(value)
-	return validate_cidr(nil, value) or trim(value):match("^%d+%.%d+%.%d+%.%d+$")
+	return validate_cidr(value) or trim(value):match("^%d+%.%d+%.%d+%.%d+$")
 end
 
 local function validate_turn_item(value)
@@ -524,7 +524,7 @@ local function validate_subnet_mapping_item(value)
 
 	local first, second = value:match("^([^,]+),([^,]+)$")
 	if not first or not second
-		or not validate_cidr(nil, first) or not validate_cidr(nil, second) then
+		or not validate_cidr(first) or not validate_cidr(second) then
 		return nil, translate("格式错误，应为映射 CIDR,实际 CIDR")
 	end
 	local _, mapped_prefix = first:match("^(%d+%.%d+%.%d+%.%d+)/(%d+)$")
@@ -649,7 +649,7 @@ local function validate_virtual_ip(self, value)
 	if is_ipv4(value) then
 		return value
 	end
-	return validate_cidr(self, value)
+	return validate_cidr(value)
 end
 
 local function validate_uint_range(minimum, maximum, message)
