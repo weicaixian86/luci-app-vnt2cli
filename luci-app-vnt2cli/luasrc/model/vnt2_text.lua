@@ -103,7 +103,26 @@ local log_message_pattern_rules = {
 	{ "^upload note: archive has no vnt2_ctrl; kept existing control tool$", "上传提示：压缩包中没有 vnt2_ctrl，已保留现有控制工具" },
 	{ "^upload warning: extracted vnt2_ctrl is not a valid ELF binary; kept existing control tool$", "上传警告：解压出的 vnt2_ctrl 不是有效的 ELF 程序，已保留现有控制工具" },
 	{ "^all download mirrors failed repo=(.+) tag=(.+) strategy=(.+) arch=(.+) scope=(.+)$", "所有下载镜像均失败：repo=%1 tag=%2 strategy=%3 arch=%4 scope=%5" },
-	{ "^(.+) auto download failed, fallback to uploaded binary (.+)$", "%1 自动下载失败，已回退到已上传程序：%2" }
+	{ "^(.+) auto download failed, fallback to uploaded binary (.+)$", "%1 自动下载失败，已回退到已上传程序：%2" },
+
+	-- Binary (vnt2_cli) runtime/startup error hints: map the binary's own error
+	-- wording to the responsible plugin setting so the merged runtime log and the
+	-- status page "last start error" field explain *which* option is wrong.
+	{ "IP重复", "注册失败：本虚拟 IP 被同一网络的其它设备/旧会话占用（服务端侧旧租约未释放），非本地设置错误，重启对端或等待服务端回收后通常自恢复" },
+	{ "[Ii]P重复", "注册失败：本虚拟 IP 被同一网络的其它设备/旧会话占用（服务端侧旧租约未释放），非本地设置错误" },
+	{ "invalid[^%c]*ip", "虚拟 IP 格式非法：请检查「设备与网卡 → 虚拟 IP」设置（应为 10.26.0.x/24 之类合法 CIDR）" },
+	{ "invalid[^%c]*config", "运行配置解析失败：多半是「编辑配置文本」里写了非法 TOML，建议改回「插件设置」表单重填" },
+	{ "failed to parse", "运行配置解析失败：多半是「编辑配置文本」里写了非法 TOML，建议改回「插件设置」表单重填" },
+	{ "toml parse error", "运行配置解析失败：TOML 语法错误，请检查「编辑配置文本」里的内容" },
+	{ "permission denied", "权限不足：请确认以 root 运行 vnt2_cli 且 /tmp/logs 目录可写" },
+	{ "no such file", "文件缺失：二进制或配置文件路径不存在" },
+	{ "address already in use", "控制端口被占用：请检查「插件设置 → 控制端口 ctrl_port」（默认 11233）是否被其它程序占用" },
+	{ "addr in use", "控制端口被占用：请检查 ctrl_port 设置（默认 11233）" },
+	{ "panic", "二进制运行时崩溃（panic）：详见下方 stderr 捕获日志，通常是二进制与当前固件/CPU 不兼容" },
+	{ "invalid[^%c]*token", "网络令牌无效：请检查「基本设置 → network_code / subscription」是否填写正确或已过期" },
+	{ "invalid[^%c]*subscription", "订阅无效：请检查「基本设置 → subscription」" },
+	{ "invalid[^%c]*network_code", "网络码无效：请检查「基本设置 → network_code」" },
+	{ "invalid[^%c]*server", "服务器地址无效：请检查「传输与隧道 → 服务器」列表中的地址格式" }
 }
 
 function M.sanitize_text(content)

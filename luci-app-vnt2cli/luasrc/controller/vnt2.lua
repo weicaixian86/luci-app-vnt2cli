@@ -5,11 +5,12 @@ local sys = require "luci.sys"
 local http = require "luci.http"
 local uci = require "luci.model.uci".cursor()
 local textutil = require "luci.model.vnt2_text"
-local LOG_DISPLAY_LINES = 300
+local LOG_DISPLAY_LINES = 1000
 local VERSION_STATE_FILE = "/etc/config/vnt2-cli.version"
 local FIXED_VNT2_VERSION = "2.0.10"
 local CLIENT_LOG_FILE = "/tmp/logs/vnt2.log"
 local CLIENT_LOG_DIR = "/tmp/logs"
+local CLI_STDERR_LOG = "/tmp/vnt2-cli-stderr.log"
 local DOWNLOAD_LOG_FILE = "/tmp/vnt2-download.log"
 local DOWNLOAD_STATE_FILE = "/tmp/vnt2-download-cli.state"
 local RESTART_PENDING_FILE = "/tmp/vnt2-restart.pending"
@@ -450,6 +451,10 @@ function act_status()
 	e.ctrl_available = file_exists(get_ctrl_bin())
 	e.ctrl_info = nil
 	e.ctrl_error = ""
+	e.cli_start_error = ""
+	if not e.cli_running then
+		e.cli_start_error = get_cli_start_error()
+	end
 	if not e.ctrl_available then
 		e.ctrl_error = "vnt2_ctrl 不可用"
 	elseif not e.cli_running then
@@ -502,8 +507,46 @@ end
 local function write_runtime_log()
 	plain_write(textutil.merge_log_files({
 		CLIENT_LOG_FILE,
+		CLI_STDERR_LOG,
 		DOWNLOAD_LOG_FILE
 	}, LOG_DISPLAY_LINES))
+end
+
+-- Build a human-readable "why the client failed to start" summary from the
+-- binary's captured stderr (panics/early errors) and, as a fallback, the ERROR
+-- lines in its structured log. Only consulted when the client is not running.
+-- Messages are run through translate_log_message so binary error keywords map
+-- to the responsible setting (e.g. invalid IP -> 虚拟IP/网段设置).
+local function get_cli_start_error()
+	local tail = textutil.read_log_file(CLI_STDERR_LOG, 30) or ""
+	tail = tail:gsub("%s+$", "")
+	if tail ~= "" then
+		-- Keep only the last ~12 lines to stay readable.
+		local lines = {}
+		for line in (tail .. "\n"):gmatch("(.-)\n") do
+			lines[#lines + 1] = line
+		end
+		local picked = {}
+		local start = (#lines > 12) and (#lines - 11) or 1
+		for i = start, #lines do
+			picked[#picked + 1] = textutil.translate_log_message(lines[i])
+		end
+		return table.concat(picked, "\n")
+	end
+
+	local log = textutil.read_log_file(CLIENT_LOG_FILE, 60) or ""
+	local errors = {}
+	for line in (log .. "\n"):gmatch("(.-)\n") do
+		if line:match("ERROR") or line:lower():match("panic")
+				or line:lower():match("error") or line:lower():match("fail") then
+			errors[#errors + 1] = textutil.translate_log_message(line)
+		end
+	end
+	if #errors == 0 then
+		return ""
+	end
+	local start = (#errors > 12) and (#errors - 11) or 1
+	return table.concat(errors, "\n", start)
 end
 
 function get_runtime_log()
@@ -513,6 +556,7 @@ end
 function clear_runtime_log()
 	clear_log_file(CLIENT_LOG_FILE)
 	clear_log_file(DOWNLOAD_LOG_FILE)
+	clear_log_file(CLI_STDERR_LOG)
 	-- Also drop rotated client log files (log4rs fixed window: vnt2.N.log).
 	if fs.access(CLIENT_LOG_DIR) then
 		for name in fs.dir(CLIENT_LOG_DIR) do

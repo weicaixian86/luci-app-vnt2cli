@@ -109,6 +109,7 @@ local ctrl_query_url = dsp.build_url("admin", "vpn", "vnt2", "ctrl_query")
 			<tr><td>本地版本</td><td id="cli_tag">-</td></tr>
 			<tr><td>目标版本</td><td id="cli_target_tag">-</td></tr>
 			<tr><td>下载状态</td><td id="cli_download">-</td></tr>
+			<tr id="cli_start_error_row" style="display:none;"><td>最近启动错误</td><td id="cli_start_error">-</td></tr>
 		</table>
 	</fieldset>
 
@@ -223,6 +224,16 @@ local ctrl_query_url = dsp.build_url("admin", "vpn", "vnt2", "ctrl_query")
 		setHtml("cli_tag", text(data.cli_tag));
 		setHtml("cli_target_tag", text(data.cli_target_tag));
 		setHtml("cli_download", stateText(data.cli_download));
+
+		var errRow = byId("cli_start_error_row");
+		if (errRow) {
+			if (!running && data.cli_start_error) {
+				errRow.style.display = "";
+				setHtml("cli_start_error", text(data.cli_start_error, "-"));
+			} else {
+				errRow.style.display = "none";
+			}
+		}
 
 		var info = data.ctrl_info;
 		var note = byId("ctrl_state_note");

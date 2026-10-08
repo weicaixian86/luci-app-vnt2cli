@@ -11,6 +11,13 @@ DOWNLOAD_LOG="/tmp/vnt2-download.log"
 
 CLI_TIME="/tmp/vnt2_cli_time"
 
+# Captures the binary's stderr (panics, early config/parse errors printed
+# before log4rs initializes, and any Rust backtrace). The binary's own
+# structured logs go to /tmp/logs/vnt2.log via log4rs; stdout is discarded by
+# procd, so only abnormal output lands here. Surfaced in the runtime log view
+# and the status page "last start error" field when the client is not running.
+CLI_STDERR_LOG="/tmp/vnt2-cli-stderr.log"
+
 # vnt2_cli (Rust/log4rs) writes its own file log to /tmp/logs/vnt2.log via a
 # log4rs config it generates on first run. Its default timestamp pattern is
 # RFC3339 with nanosecond precision and a zone offset
@@ -2460,9 +2467,10 @@ start_cli_instance() {
 
 	log_service "using ${cli_bin} ctrl=${ctrl_bin} port=${ctrl_port} conf=${TOML_EXPORT_FILE}"
 	ensure_client_log_config
+	: >"${CLI_STDERR_LOG}" 2>/dev/null || true
 	procd_open_instance "vnt2_cli"
 	procd_set_param env RUST_LOG="$log_level"
-	procd_set_param command /bin/sh -c "cd /tmp && exec \"${cli_bin}\" --conf \"${TOML_EXPORT_FILE}\" --ctrl-port \"${ctrl_port}\""
+	procd_set_param command /bin/sh -c "cd /tmp && exec \"${cli_bin}\" --conf \"${TOML_EXPORT_FILE}\" --ctrl-port \"${ctrl_port}\" 2>>\"${CLI_STDERR_LOG}\""
 	procd_set_param stdout 0
 	procd_set_param stderr 0
 	procd_set_param respawn 3600 5 5
