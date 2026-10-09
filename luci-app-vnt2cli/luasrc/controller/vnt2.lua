@@ -531,9 +531,9 @@ end
 
 local function write_runtime_log()
 	plain_write(textutil.merge_log_files({
-		CLIENT_LOG_FILE,
-		CLI_STDERR_LOG,
-		DOWNLOAD_LOG_FILE
+		{ path = CLIENT_LOG_FILE, utc = true },
+		{ path = CLI_STDERR_LOG, utc = true },
+		{ path = DOWNLOAD_LOG_FILE, utc = false }
 	}, LOG_DISPLAY_LINES))
 end
 
@@ -544,6 +544,7 @@ end
 -- to the responsible setting (e.g. invalid IP -> 虚拟IP/网段设置).
 local function get_cli_start_error()
 	local tail = textutil.read_log_file(CLI_STDERR_LOG, 30) or ""
+	tail = tail:gsub("(%d%d%d%d%-%d%d%-%d%d %d%d:%d%d:%d%d)", utc_str_to_local)
 	tail = tail:gsub("%s+$", "")
 	if tail ~= "" then
 		-- Keep only the last ~12 lines to stay readable.
@@ -560,6 +561,7 @@ local function get_cli_start_error()
 	end
 
 	local log = textutil.read_log_file(CLIENT_LOG_FILE, 60) or ""
+	log = log:gsub("(%d%d%d%d%-%d%d%-%d%d %d%d:%d%d:%d%d)", utc_str_to_local)
 	local errors = {}
 	for line in (log .. "\n"):gmatch("(.-)\n") do
 		if line:match("ERROR") or line:lower():match("panic")

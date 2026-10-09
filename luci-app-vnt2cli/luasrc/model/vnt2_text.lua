@@ -293,6 +293,21 @@ local TZ_OFFSET = (function()
 	return os.difftime(t, os.time(os.date("!*t", t)))
 end)()
 
+-- Convert a "YYYY-MM-DD HH:MM:SS" token emitted by the Rust client (UTC) into
+-- the device local timezone. Plugin/shell logs are already local, so only the
+-- client sources (vnt2.log, cli-stderr) should pass through this.
+local LOG_TS_PAT = "(%d%d%d%d%-%d%d%-%d%d %d%d:%d%d:%d%d)"
+local function utc_to_local_ts(s)
+	local y, mo, d, h, mi, se = tostring(s):match("^(%d+)%-(%d+)%-(%d+) (%d+):(%d+):(%d+)$")
+	if not y then return s end
+	local epoch = os.time({
+		year = tonumber(y), month = tonumber(mo), day = tonumber(d),
+		hour = tonumber(h), min = tonumber(mi), sec = tonumber(se), isdst = false
+	})
+	if not epoch then return s end
+	return os.date("%Y-%m-%d %H:%M:%S", epoch + TZ_OFFSET)
+end
+
 local function log_timestamp(line)
 	local y, mo, d, h, mi, s = tostring(line or ""):match(
 		"^(%d%d%d%d)%-(%d%d)%-(%d%d) (%d%d):(%d%d):(%d%d)")
@@ -346,8 +361,20 @@ end
 
 function M.merge_log_files(paths, max_lines)
 	local records = {}
-	for _, path in ipairs(paths or {}) do
-		parse_log_records(M.read_log_file(path, max_lines), records)
+	for _, item in ipairs(paths or {}) do
+		local path, utc
+		if type(item) == "table" then
+			path = item.path
+			utc = item.utc
+		else
+			path = item
+			utc = false
+		end
+		local content = M.read_log_file(path, max_lines)
+		if utc then
+			content = content:gsub(LOG_TS_PAT, utc_to_local_ts)
+		end
+		parse_log_records(content, records)
 	end
 
 	table.sort(records, function(a, b)

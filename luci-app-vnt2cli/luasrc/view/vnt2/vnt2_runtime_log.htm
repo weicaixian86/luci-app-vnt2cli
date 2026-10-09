@@ -2,8 +2,8 @@
 local textutil = require "luci.model.vnt2_text"
 local function read_runtime_log()
 	return textutil.merge_log_files({
-		"/tmp/logs/vnt2.log",
-		"/tmp/vnt2-download.log"
+		{ path = "/tmp/logs/vnt2.log", utc = true },
+		{ path = "/tmp/vnt2-download.log", utc = false }
 	}, 300)
 end
 local log_content = read_runtime_log()
