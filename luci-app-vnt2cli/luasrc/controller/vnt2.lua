@@ -341,6 +341,27 @@ local function parse_state_file(path)
 	return out
 end
 
+-- vnt2_ctrl emits timestamps in UTC: vnt-ipc's ts_to_string() uses
+-- time::UtcOffset::local_offset_at(), which returns UTC for the short-lived
+-- musl process LuCI spawns (the long-running vnt2_cli daemon, by contrast,
+-- picks up the device local timezone and so its log4rs log is already local).
+-- Re-interpret the "YYYY-MM-DD HH:MM:SS" string as UTC and reformat it in the
+-- device local timezone (not hardcoded +8, so it stays correct elsewhere).
+local function utc_str_to_local(s)
+	if not s or s == "" then return s end
+	local y, mo, d, h, mi, se = s:match("^(%d+)%-(%d+)%-(%d+) (%d+):(%d+):(%d+)$")
+	if not y then return s end
+	local local_epoch = os.time({
+		year = tonumber(y), month = tonumber(mo), day = tonumber(d),
+		hour = tonumber(h), min = tonumber(mi), sec = tonumber(se), isdst = false
+	})
+	if not local_epoch then return s end
+	-- os.time() above treated the fields as LOCAL; derive the UTC epoch by
+	-- subtracting the local offset at that instant, then format back as local.
+	local offset = os.difftime(local_epoch, os.time(os.date("!*t", local_epoch)))
+	return os.date("%Y-%m-%d %H:%M:%S", local_epoch + offset)
+end
+
 -- vnt2_ctrl only listens on 127.0.0.1 and every call is wrapped in an outer
 -- timeout so a stalled control port cannot hold the LuCI polling request.
 local function query_ctrl(subcommand)
@@ -396,7 +417,7 @@ local function parse_ctrl_info(text)
 				out.server = trim(addr or value)
 				out.server_status = trim(status or "")
 			elseif key == "Last Connected Time" then
-				out.last_connected = value
+				out.last_connected = utc_str_to_local(value)
 			elseif key == "Name" then
 				out.name = value
 			elseif key == "Id" then
