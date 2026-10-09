@@ -91,8 +91,9 @@ jobs:
       - name: Download and extract SDK
         run: |
           set -e
-          curl -fsSL "${{ matrix.sdk_url }}" -o sdk.tar.zst
-          mkdir sdk
+          curl -fsSL --http1.1 --retry 5 --retry-delay 5 --retry-all-errors \
+            "${{ matrix.sdk_url }}" -o sdk.tar.zst
+          mkdir -p sdk
           tar --zstd -xf sdk.tar.zst -C sdk --strip-components=1
 
       - name: Build package
