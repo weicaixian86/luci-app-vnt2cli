@@ -513,7 +513,11 @@ function act_ctrl_query()
 		e.error = err or "查询失败"
 	else
 		e.ok = true
-		e.text = text
+		-- vnt2_ctrl emits timestamps in UTC (vnt-ipc ts_to_string). The clients
+		-- list carries a "Last Connected Time" column in that format; rewrite any
+		-- "YYYY-MM-DD HH:MM:SS" token to the device local timezone. route/ips
+		-- output has no such token, so the gsub is a no-op there.
+		e.text = text:gsub("(%d%d%d%d%-%d%d%-%d%d %d%d:%d%d:%d%d)", utc_str_to_local)
 	end
 	json_write(e)
 end
