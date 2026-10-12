@@ -62,6 +62,119 @@ clear_version_state() {
 	rm -f "$VERSION_STATE_FILE" "$VERSION_STATE_FILE".* >/dev/null 2>&1
 }
 
+# Decide between big-endian mips and little-endian mipsel by reading the ELF
+# EI_DATA byte (offset 5) of /proc/self/exe. On ath79 (AR9331 etc.) `uname -m`
+# reports "mips" for both, so uname alone is not enough.
+detect_mips_endian() {
+	local ei_data
+	ei_data="$(dd if=/proc/self/exe bs=1 skip=5 count=1 2>/dev/null)"
+	if [ "$ei_data" = "$(printf '\001')" ]; then
+		echo "mipsel"
+	else
+	echo "mips"
+fi
+}
+
+# Read the 32-bit little-endian e_flags field (ELF header, offset 24) of an ELF
+# file and print it as a decimal integer. Portable: reads four bytes with dd and
+# decodes each with `od -An -tx1` (a format busybox od supports). Falls back to
+# 0 if the file is unreadable or not a valid ELF.
+read_elf_eflags_le() {
+	local f="$1" b0 b1 b2 b3 v
+	[ -r "$f" ] || { echo 0; return; }
+	is_elf_binary "$f" >/dev/null 2>&1 || { echo 0; return; }
+	b0="$(dd if="$f" bs=1 skip=24 count=1 2>/dev/null | od -An -tx1 | tr -dc '0-9a-fA-F')"
+	b1="$(dd if="$f" bs=1 skip=25 count=1 2>/dev/null | od -An -tx1 | tr -dc '0-9a-fA-F')"
+	b2="$(dd if="$f" bs=1 skip=26 count=1 2>/dev/null | od -An -tx1 | tr -dc '0-9a-fA-F')"
+	b3="$(dd if="$f" bs=1 skip=27 count=1 2>/dev/null | od -An -tx1 | tr -dc '0-9a-fA-F')"
+	b0="${b0:-0}"; b1="${b1:-0}"; b2="${b2:-0}"; b3="${b3:-0}"
+	[ -z "${b0}${b1}${b2}${b3}" ] && { echo 0; return; }
+	v=$(( 0x$b0 + (0x$b1 << 8) + (0x$b2 << 16) + (0x$b3 << 24) ))
+	echo "$v"
+}
+
+# Decide the ARM float ABI by inspecting the ELF e_flags of a binary on the
+# running system. EF_ARM_ABI_FLOAT_HARD (bit 10, 0x400) => musleabihf;
+# EF_ARM_ABI_FLOAT_SOFT (bit 9, 0x200) => musleabi. The low 4 bits of e_flags
+# are the EABI version; for legacy (non-EABI) ELF the float bits are not
+# meaningful, so we return empty and let callers fall back. This is the ARM
+# analogue of the endian probe used for MIPS.
+detect_arm_float() {
+	local f flags eabi
+	for f in /proc/self/exe /bin/busybox /lib/libc.so* /bin/sh /sbin/init /bin/ash /lib/ld-musl-arm*.so.1; do
+		[ -r "$f" ] || continue
+		flags="$(read_elf_eflags_le "$f")"
+		# EABI version lives in the top byte (bits 24-27, EF_ARM_EABIMASK);
+		# for legacy (non-EABI) ELF the float bits are not meaningful.
+		eabi=$(( (flags >> 24) & 0xFF ))
+		[ "$eabi" -ge 1 ] || continue
+		if [ $((flags & 0x400)) -ne 0 ]; then
+			echo "musleabihf"; return 0
+		elif [ $((flags & 0x200)) -ne 0 ]; then
+			echo "musleabi"; return 0
+		fi
+	done
+	echo ""
+}
+
+sha256_of() {
+	local f="$1"
+	[ -s "$f" ] || return 1
+	command -v sha256sum >/dev/null 2>&1 || return 1
+	sha256sum "$f" 2>/dev/null | awk '{print $1}'
+}
+
+have_pkg_mgr() {
+	command -v apk  >/dev/null 2>&1 && { echo apk;  return; }
+	command -v opkg >/dev/null 2>&1 && { echo opkg; return; }
+	echo ""
+}
+
+pm_install_pkg() {
+	local pkg="$1" pm out rc=0 pid watch
+	pm="$(have_pkg_mgr)"
+	[ -n "$pm" ] || return 1
+	command -v "$pkg" >/dev/null 2>&1 && return 0
+	out="$DOWNLOAD_LOG"
+	if command -v timeout >/dev/null 2>&1; then
+		timeout 120 "$pm" update >/dev/null 2>&1
+		case "$pm" in
+			apk)  timeout 180 "$pm" add "$pkg" >>"$out" 2>&1 || rc=$? ;;
+			opkg) timeout 180 "$pm" install "$pkg" >>"$out" 2>&1 || rc=$? ;;
+		esac
+	else
+		( "$pm" update >/dev/null 2>&1 ) &
+		pid=$!; ( sleep 120; kill "$pid" 2>/dev/null ) >/dev/null 2>&1 & watch=$!
+		wait "$pid" 2>/dev/null; kill "$watch" 2>/dev/null
+		case "$pm" in
+			apk)  ( "$pm" add "$pkg" >>"$out" 2>&1 ) & ;;
+			opkg) ( "$pm" install "$pkg" >>"$out" 2>&1 ) & ;;
+		esac
+		pid=$!; ( sleep 180; kill "$pid" 2>/dev/null ) >/dev/null 2>&1 & watch=$!
+		wait "$pid" 2>/dev/null; rc=$?; kill "$watch" 2>/dev/null
+	fi
+	command -v "$pkg" >/dev/null 2>&1
+}
+
+get_upx_setting() {
+	local v=""
+	command -v uci >/dev/null 2>&1 && v="$(uci -q get vnt2.@vnt2_cli[0].upx_compress 2>/dev/null || true)"
+	[ "$v" = "0" ] && echo "0" || echo "1"
+}
+
+ensure_runtime_deps_upload() {
+	# curl is the preferred downloader; wget is the fallback. Install them as a
+	# safety net if missing (e.g. after an accidental removal or broken feed).
+	command -v curl >/dev/null 2>&1 || pm_install_pkg curl >/dev/null 2>&1 || \
+		log_worker "runtime install of curl failed or unavailable"
+	command -v wget >/dev/null 2>&1 || pm_install_pkg wget >/dev/null 2>&1 || \
+		log_worker "runtime install of wget failed or unavailable"
+	pm_install_pkg unzip >/dev/null 2>&1 || log_worker "runtime install of unzip failed or unavailable"
+	if [ "$VNT2_UPX_COMPRESS" = "1" ]; then
+		pm_install_pkg upx >/dev/null 2>&1 || log_worker "runtime install of upx failed or unavailable"
+	fi
+}
+
 is_elf_binary() {
 	local bin="$1"
 	local magic expected
@@ -87,28 +200,34 @@ detect_arch_name() {
 		armv7*) arm_family="armv7" ;;
 		arm*) arm_family="arm" ;;
 		mipsel*) echo "mipsel"; return 0 ;;
-		mips*) echo "mips"; return 0 ;;
+		mips*) detect_mips_endian; return 0 ;;
 		*) ;;
 	esac
 	if [ -n "$arm_family" ]; then
-		if [ -e /lib/ld-musl-armhf.so.1 ] || [ -e /lib/ld-musl-armhf.so.1.* ]; then
-			arm_abi="musleabihf"
-		elif [ -e /lib/ld-musl-arm.so.1 ] || [ -e /lib/ld-musl-arm.so.1.* ]; then
-			arm_abi="musleabi"
-		else
-			case "$package_arch" in
-				*eabihf*|*hard*|*hf*|*neon*|*vfp*) arm_abi="musleabihf" ;;
-				*eabi*|*soft*) arm_abi="musleabi" ;;
-				*) arm_abi="" ;;
-			esac
-		fi
+		# Prefer an ELF-header probe of the running system (reads e_flags to tell
+		# hard-float musleabihf from soft-float musleabi). Mirrors the endian
+		# probe used for MIPS. Loader symlinks / package arch are fallbacks.
+		arm_abi="$(detect_arm_float)"
+		[ -z "$arm_abi" ] && {
+			if [ -e /lib/ld-musl-armhf.so.1 ] || [ -e /lib/ld-musl-armhf.so.1.* ]; then
+				arm_abi="musleabihf"
+			elif [ -e /lib/ld-musl-arm.so.1 ] || [ -e /lib/ld-musl-arm.so.1.* ]; then
+				arm_abi="musleabi"
+			else
+				case "$package_arch" in
+					*eabihf*|*hard*|*hf*|*neon*|*vfp*) arm_abi="musleabihf" ;;
+					*eabi*|*soft*) arm_abi="musleabi" ;;
+					*) arm_abi="" ;;
+				esac
+			fi
+		}
 		[ -n "$arm_abi" ] && { echo "${arm_family}-${arm_abi}"; return 0; }
 	fi
 	case "$package_arch" in
 		*x86_64*|*amd64*) echo "x86_64" ;;
 		*aarch64*|*arm64*) echo "aarch64" ;;
 		*mipsel*) echo "mipsel" ;;
-		*mips*) echo "mips" ;;
+		*mips*) detect_mips_endian ;;
 		*) echo "unsupported" ;;
 	esac
 }
@@ -235,7 +354,16 @@ install_binary_atomic() {
 		rm -f "$temp_path" >/dev/null 2>&1
 		return 1
 	}
-	chmod 755 "$temp_path" >/dev/null 2>&1 || {
+	# Compress with UPX when enabled (shrinks the on-disk binary). UPX rewrites
+	# the file in place and the result stays a valid ELF.
+	if [ "$VNT2_UPX_COMPRESS" = "1" ] && command -v upx >/dev/null 2>&1; then
+		if upx -q -q --force "$temp_path" >/dev/null 2>&1; then
+			log_worker "UPX compressed $(basename "$target")"
+		else
+			log_worker "UPX compress failed for $(basename "$target"), kept uncompressed"
+		fi
+	fi
+	chmod 777 "$temp_path" >/dev/null 2>&1 || {
 		rm -f "$temp_path" >/dev/null 2>&1
 		return 1
 	}
@@ -303,6 +431,8 @@ process_claimed() {
 	upload_name="$(read_marker_field "$CLAIMED_FILE" name)"
 	upload_asset="$(basename "${upload_name:-vnt2_cli}")"
 	arch="$(detect_arch_name)"
+	VNT2_UPX_COMPRESS="$(get_upx_setting)"
+	ensure_runtime_deps_upload
 
 	case "$upload_path" in
 		"${UPLOAD_DIR}/incoming."*) ;;

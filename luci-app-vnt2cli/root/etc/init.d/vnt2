@@ -533,25 +533,31 @@ detect_arch_name() {
 			return 0
 		;;
 		mips*)
-			echo "mips"
+			detect_mips_endian
 			return 0
 		;;
 	esac
 
 	if [ -n "$arm_family" ]; then
-		# The musl loader is the authoritative ABI marker. Package names are
-		# used as a fallback where the loader symlink is absent.
-		if [ -e /lib/ld-musl-armhf.so.1 ] || [ -e /lib/ld-musl-armhf.so.1.* ]; then
-			arm_abi="musleabihf"
-		elif [ -e /lib/ld-musl-arm.so.1 ] || [ -e /lib/ld-musl-arm.so.1.* ]; then
-			arm_abi="musleabi"
-		else
-			case "$package_arch" in
-				*eabihf*|*hard*|*hf*|*neon*|*vfp*) arm_abi="musleabihf" ;;
-				*eabi*|*soft*) arm_abi="musleabi" ;;
-				*) arm_abi="" ;;
-			esac
-		fi
+		# Prefer an ELF-header probe of the running system (reads e_flags to
+		# tell hard-float musleabihf from soft-float musleabi). This mirrors the
+		# endian probe used for MIPS and is robust even when the musl loader
+		# symlinks are absent. Loader symlinks / package arch are used only as
+		# fallbacks when the ELF probe cannot decide.
+		arm_abi="$(detect_arm_float)"
+		[ -z "$arm_abi" ] && {
+			if [ -e /lib/ld-musl-armhf.so.1 ] || [ -e /lib/ld-musl-armhf.so.1.* ]; then
+				arm_abi="musleabihf"
+			elif [ -e /lib/ld-musl-arm.so.1 ] || [ -e /lib/ld-musl-arm.so.1.* ]; then
+				arm_abi="musleabi"
+			else
+				case "$package_arch" in
+					*eabihf*|*hard*|*hf*|*neon*|*vfp*) arm_abi="musleabihf" ;;
+					*eabi*|*soft*) arm_abi="musleabi" ;;
+					*) arm_abi="" ;;
+				esac
+			fi
+		}
 		[ -n "$arm_abi" ] && {
 			echo "${arm_family}-${arm_abi}"
 			return 0
@@ -571,12 +577,189 @@ detect_arch_name() {
 			echo "mipsel"
 		;;
 		*mips*)
-			echo "mips"
+			detect_mips_endian
 		;;
 		*)
 			echo "unsupported"
 		;;
 	esac
+}
+
+# --- VNT2 enhanced helpers: endian-aware MIPS, SHA256, regex arch match, deps ---
+
+# Decide between big-endian mips and little-endian mipsel by reading the ELF
+# EI_DATA byte (offset 5) of the running interpreter at /proc/self/exe. On
+# ath79 (AR9331 etc.) `uname -m` reports "mips" for both, so uname alone is
+# not enough. 1 = little-endian (mipsel), 2 = big-endian (mips).
+detect_mips_endian() {
+	local ei_data
+	ei_data="$(dd if=/proc/self/exe bs=1 skip=5 count=1 2>/dev/null)"
+	if [ "$ei_data" = "$(printf '\001')" ]; then
+		echo "mipsel"
+	else
+		echo "mips"
+	fi
+}
+
+# Read the 32-bit little-endian e_flags field (ELF header, offset 24) of an ELF
+# file and print it as a decimal integer. Portable: reads four bytes with dd and
+# decodes each with `od -An -tx1` (a format busybox od supports). Falls back to
+# 0 if the file is unreadable or not a valid ELF.
+read_elf_eflags_le() {
+	local f="$1" b0 b1 b2 b3 v
+	[ -r "$f" ] || { echo 0; return; }
+	is_elf_binary "$f" >/dev/null 2>&1 || { echo 0; return; }
+	b0="$(dd if="$f" bs=1 skip=24 count=1 2>/dev/null | od -An -tx1 | tr -dc '0-9a-fA-F')"
+	b1="$(dd if="$f" bs=1 skip=25 count=1 2>/dev/null | od -An -tx1 | tr -dc '0-9a-fA-F')"
+	b2="$(dd if="$f" bs=1 skip=26 count=1 2>/dev/null | od -An -tx1 | tr -dc '0-9a-fA-F')"
+	b3="$(dd if="$f" bs=1 skip=27 count=1 2>/dev/null | od -An -tx1 | tr -dc '0-9a-fA-F')"
+	b0="${b0:-0}"; b1="${b1:-0}"; b2="${b2:-0}"; b3="${b3:-0}"
+	[ -z "${b0}${b1}${b2}${b3}" ] && { echo 0; return; }
+	v=$(( 0x$b0 + (0x$b1 << 8) + (0x$b2 << 16) + (0x$b3 << 24) ))
+	echo "$v"
+}
+
+# Decide the ARM float ABI by inspecting the ELF e_flags of a binary on the
+# running system. EF_ARM_ABI_FLOAT_HARD (bit 10, 0x400) => musleabihf;
+# EF_ARM_ABI_FLOAT_SOFT (bit 9, 0x200) => musleabi. The low 4 bits of e_flags
+# are the EABI version; for legacy (non-EABI) ELF the float bits are not
+# meaningful, so we return empty and let callers fall back. This is the ARM
+# analogue of the endian probe used for MIPS.
+detect_arm_float() {
+	local f flags eabi
+	for f in /proc/self/exe /bin/busybox /lib/libc.so* /bin/sh /sbin/init /bin/ash /lib/ld-musl-arm*.so.1; do
+		[ -r "$f" ] || continue
+		flags="$(read_elf_eflags_le "$f")"
+		# EABI version lives in the top byte (bits 24-27, EF_ARM_EABIMASK);
+		# for legacy (non-EABI) ELF the float bits are not meaningful.
+		eabi=$(( (flags >> 24) & 0xFF ))
+		[ "$eabi" -ge 1 ] || continue
+		if [ $((flags & 0x400)) -ne 0 ]; then
+			echo "musleabihf"; return 0
+		elif [ $((flags & 0x200)) -ne 0 ]; then
+			echo "musleabi"; return 0
+		fi
+	done
+	echo ""
+}
+
+sha256_of() {
+	local f="$1"
+	[ -s "$f" ] || return 1
+	command -v sha256sum >/dev/null 2>&1 || return 1
+	sha256sum "$f" 2>/dev/null | awk '{print $1}'
+}
+
+arch_primary_token() {
+	case "$1" in
+		armv7-*) echo "armv7" ;;
+		arm-*)   echo "arm" ;;
+		*)       echo "$1" ;;
+	esac
+}
+
+arch_token_regex() {
+	# Match the architecture as a standalone word, bounded by - _ . or the
+	# string edge, so "mipsel" never accidentally matches a "mips" asset and
+	# vice-versa. This makes asset selection fault-tolerant to minor naming.
+	local token="$1"
+	printf '(^|[-_.])%s([-_.]|$)' "$token"
+}
+
+release_checksum_asset_url() {
+	local json_file="$1"
+	local asset_name="$2"
+	local base urls url fn
+	base="${asset_name%.zip}"
+	[ "$base" = "$asset_name" ] && base="${asset_name%.tar.gz}"
+	[ "$base" = "$asset_name" ] && base="${asset_name%.tgz}"
+	urls="$(extract_release_urls "$json_file")"
+	[ -n "$urls" ] || return 1
+	while IFS= read -r url; do
+		[ -n "$url" ] || continue
+		fn="${url##*/}"
+		fn="${fn%%\?*}"
+		case "$fn" in
+			"${asset_name}.sha256"|"${asset_name}.sha512"|"${base}.sha256"|"${base}.sha512"|"sha256.txt"|"checksums.txt"|"checksum.txt"|"SHA256SUMS")
+				echo "$url"
+				return 0
+				;;
+		esac
+	done <<EOF
+$urls
+EOF
+	return 1
+}
+
+fetch_release_sha256() {
+	local checksum_url="$1"
+	local asset_name="$2"
+	local tmp sum
+	tmp="$(mktemp "${TMPDIR:-/tmp}/vnt2sum.XXXXXX" 2>/dev/null)" || return 1
+	if download_file "$checksum_url" "$tmp" "checksum" "auto"; then
+		sum="$(grep -E "$asset_name" "$tmp" 2>/dev/null | grep -Eo '[0-9a-fA-F]{64}' | head -n1)"
+		[ -z "$sum" ] && sum="$(grep -Eo '[0-9a-fA-F]{64}' "$tmp" 2>/dev/null | head -n1)"
+	fi
+	rm -f "$tmp"
+	[ -n "$sum" ] && echo "$sum"
+}
+
+fetch_content_length() {
+	local url="$1" dl="$2" len
+	[ "$dl" = "curl" ] || { echo "0"; return 0; }
+	len="$(curl -sI --connect-timeout 8 --max-time 15 "$url" 2>/dev/null | tr -d '\r' | awk -F': ' 'tolower($1)=="content-length"{print $2}' | tail -1)"
+	[ -n "$len" ] && echo "$len" || echo "0"
+	return 0
+}
+
+have_pkg_mgr() {
+	command -v apk  >/dev/null 2>&1 && { echo apk;  return; }
+	command -v opkg >/dev/null 2>&1 && { echo opkg; return; }
+	echo ""
+}
+
+pm_install_pkg() {
+	local pkg="$1" pm out rc=0 pid watch
+	pm="$(have_pkg_mgr)"
+	[ -n "$pm" ] || return 1
+	command -v "$pkg" >/dev/null 2>&1 && return 0
+	out="$DOWNLOAD_LOG"
+	# Best-effort install with a hard watchdog so a missing package feed can
+	# never hang the service start. Prefer coreutils `timeout`, else fall back
+	# to a manual sleep/kill watchdog.
+	if command -v timeout >/dev/null 2>&1; then
+		timeout 120 "$pm" update >/dev/null 2>&1
+		case "$pm" in
+			apk)  timeout 180 "$pm" add "$pkg" >>"$out" 2>&1 || rc=$? ;;
+			opkg) timeout 180 "$pm" install "$pkg" >>"$out" 2>&1 || rc=$? ;;
+		esac
+	else
+		( "$pm" update >/dev/null 2>&1 ) &
+		pid=$!; ( sleep 120; kill "$pid" 2>/dev/null ) >/dev/null 2>&1 & watch=$!
+		wait "$pid" 2>/dev/null; kill "$watch" 2>/dev/null
+		case "$pm" in
+			apk)  ( "$pm" add "$pkg" >>"$out" 2>&1 ) & ;;
+			opkg) ( "$pm" install "$pkg" >>"$out" 2>&1 ) & ;;
+		esac
+		pid=$!; ( sleep 180; kill "$pid" 2>/dev/null ) >/dev/null 2>&1 & watch=$!
+		wait "$pid" 2>/dev/null; rc=$?; kill "$watch" 2>/dev/null
+	fi
+	command -v "$pkg" >/dev/null 2>&1
+}
+
+ensure_runtime_deps() {
+	local want_upx="$1"
+	# curl is the preferred downloader (it is already a hard package dependency,
+	# but we install it here too as a safety net after an accidental removal or
+	# a broken initial feed). wget covers devices where curl is unavailable.
+	command -v curl >/dev/null 2>&1 || pm_install_pkg curl >/dev/null 2>&1 || \
+		log_download "runtime install of curl failed or unavailable"
+	command -v wget >/dev/null 2>&1 || pm_install_pkg wget >/dev/null 2>&1 || \
+		log_download "runtime install of wget failed or unavailable"
+	pm_install_pkg unzip >/dev/null 2>&1 || log_download "runtime install of unzip failed or unavailable"
+	[ "$want_upx" = "1" ] && {
+		pm_install_pkg upx >/dev/null 2>&1 || log_download "runtime install of upx failed or unavailable"
+	}
 }
 
 get_downloader() {
@@ -628,6 +811,7 @@ download_file() {
 	local timeout_cmd=""
 	local connect_timeout=20
 	local transfer_timeout=180
+	local prog_pid="" total_bytes
 
 	if [ "$purpose" = "api" ]; then
 		connect_timeout=10
@@ -645,6 +829,36 @@ download_file() {
 
 	for actual_url in $(get_download_url_candidates_for_mirror "$url" "$mirror" "$custom_mirror_url"); do
 		DOWNLOAD_LAST_URL="$actual_url"
+
+		# Best-effort total size for percentage reporting.
+		total_bytes="0"
+		if [ "$purpose" = "asset" ] || [ "$purpose" = "checksum" ]; then
+			total_bytes="$(fetch_content_length "$actual_url" "$downloader")"
+		fi
+
+		# Background progress watcher: poll the partial file and log a percentage
+		# (or byte count when the size is unknown) so large downloads are visible.
+		prog_pid=""
+		if [ "$purpose" = "asset" ] || [ "$purpose" = "checksum" ]; then
+			(
+				i=0
+				while [ $i -lt 200 ]; do
+					i=$((i + 1))
+					sleep 2
+					[ -f "$out" ] || continue
+					cur="$(wc -c <"$out" 2>/dev/null | tr -d '[:space:]')"
+					[ -n "$cur" ] || cur=0
+					if [ "$total_bytes" -gt 0 ] 2>/dev/null; then
+						pct=$(( cur * 100 / total_bytes ))
+						[ "$pct" -gt 100 ] && pct=100
+						log_download "下载进度 ${pct}% (${cur}/${total_bytes} 字节) 镜像=${actual_url}"
+					else
+						log_download "下载进度 ${cur} 字节 镜像=${actual_url}"
+					fi
+				done
+			) &
+			prog_pid=$!
+		fi
 
 		case "$downloader" in
 			curl)
@@ -686,6 +900,11 @@ download_file() {
 				return 1
 			;;
 		esac
+
+		if [ -n "$prog_pid" ]; then
+			kill "$prog_pid" 2>/dev/null
+			wait "$prog_pid" 2>/dev/null
+		fi
 
 		DOWNLOAD_LAST_RC="$rc"
 		[ "$rc" -eq 0 ] && return 0
@@ -1118,23 +1337,42 @@ select_release_asset() {
 	local scope="$2"
 	local version="$3"
 	local arch_name="$4"
-	local urls url filename expected
+	local urls url filename arch_token arch_pat abi_token
 
 	urls="$(extract_release_urls "$json_file")"
 	[ -n "$urls" ] || return 1
 
-	for expected in $(get_release_asset_name_candidates "$scope" "$version" "$arch_name"); do
-		while IFS= read -r url; do
-			filename="${url##*/}"
-			filename="${filename%%\?*}"
-			if [ "$filename" = "$expected" ]; then
-				echo "$url"
-				return 0
-			fi
-		done <<EOF
+	# Match by architecture token instead of an exact filename, so minor
+	# upstream naming variations (order of components, extra suffixes) still
+	# resolve. Checksum / metadata assets are skipped. For ARM we additionally
+	# require the float-ABI token (musleabihf vs musleabi) so the wrong float
+	# variant is never selected.
+	arch_token="$(arch_primary_token "$arch_name")"
+	arch_pat="$(arch_token_regex "$arch_token")"
+	case "$arch_name" in
+		*musleabihf*) abi_token="musleabihf" ;;
+		*musleabi*)    abi_token="musleabi" ;;
+	esac
+	[ -n "$arch_pat" ] || return 1
+
+	while IFS= read -r url; do
+		[ -n "$url" ] || continue
+		filename="${url##*/}"
+		filename="${filename%%\?*}"
+		case "$filename" in
+			*.sha256|*.sha512|*.md5|*.txt|*checksum*|*.sig|*.asc)
+				continue
+				;;
+		esac
+		echo "$filename" | grep -Eq -- "$arch_pat" || continue
+		if [ -n "$abi_token" ]; then
+			echo "$filename" | grep -Eq -- "$(arch_token_regex "$abi_token")" || continue
+		fi
+		echo "$url"
+		return 0
+	done <<EOF
 $urls
 EOF
-	done
 
 	return 1
 }
@@ -1354,6 +1592,16 @@ install_binary_to_usrbin() {
 		rm -f "$temp_path" >/dev/null 2>&1
 		return 1
 	}
+	# Optional UPX compression to shrink the on-disk binary (helps small-flash
+	# routers). UPX rewrites the file in place; the result stays a valid ELF.
+	upx_compress="${VNT2_UPX_COMPRESS:-1}"
+	if [ "$upx_compress" = "1" ] && command -v upx >/dev/null 2>&1; then
+		if upx -q -q --force "$temp_path" >/dev/null 2>&1; then
+			log_download "UPX compressed ${target_name}"
+		else
+			log_download "UPX compression skipped/failed for ${target_name}, installing uncompressed"
+		fi
+	fi
 	is_elf_binary "$temp_path" || {
 		log_download "installed binary is not a valid ELF file ${target_path}"
 		rm -f "$temp_path" >/dev/null 2>&1
@@ -1403,6 +1651,7 @@ auto_download_bundle_for_mode() {
 	local mirror_attempt mirror_retry_limit
 	local cache_key cache_dir query_dir json_file release_tag asset_url asset_name asset_file extracted_dir
 	local fallback_version fallback_url asset_size
+	local checksum_url expected_sha installed_cli downloaded_sha extracted_sha local_sha
 	local cli_bin ctrl_bin
 	asset_name=""
 
@@ -1423,6 +1672,8 @@ auto_download_bundle_for_mode() {
 			return 1
 		;;
 	esac
+	config_get_bool VNT2_UPX_COMPRESS "$cfg" "upx_compress" "1"
+	ensure_runtime_deps "$VNT2_UPX_COMPRESS"
 	download_mirror="$(normalize_download_mirror "$download_mirror")"
 	custom_mirror_url="$(normalize_custom_mirror_url "$custom_mirror_url")"
 	cache_mirror_key="$(get_download_mirror_cache_key "$download_repo" "$download_mirror" "$custom_mirror_url")"
@@ -1437,6 +1688,27 @@ auto_download_bundle_for_mode() {
 			return 1
 		;;
 	esac
+
+	# Skip-download gate: the upstream asset is an UNCOMPRESSED original, while
+	# the locally installed binary may be UPX-compressed. Their SHA256 can never
+	# match, so comparing SHA256 to decide whether to skip is unreliable. Instead
+	# we simply check whether the target programs already exist in the install
+	# directory by name. If both are present and valid ELF files we treat the
+	# program as already installed and skip downloading entirely.
+	installed_cli="${INSTALL_BIN_DIR}/vnt2_cli"
+	installed_ctrl="${INSTALL_BIN_DIR}/vnt2_ctrl"
+	if [ -f "$installed_cli" ] && is_elf_binary "$installed_cli" && \
+	   [ -f "$installed_ctrl" ] && is_elf_binary "$installed_ctrl"; then
+		log_download "本地 /usr/bin 已存在 vnt2_cli 与 vnt2_ctrl，跳过下载"
+		write_download_state "$state_file" "success" "本地已存在同名程序，跳过下载" "" "$download_tag" "$arch_name" "$installed_cli"
+		write_version_state "$download_tag" "local-exists" "$arch_name" "" "$installed_cli" "$installed_ctrl" || \
+			log_download "failed to persist version state tag=${download_tag}"
+		uci -q set "${CONF}.${cfg}.vnt2_cli_bin=${INSTALL_BIN_DIR}/vnt2_cli"
+		uci -q set "${CONF}.${cfg}.vnt2_ctrl_bin=${INSTALL_BIN_DIR}/vnt2_ctrl"
+		uci commit "$CONF" >/dev/null 2>&1
+		return 0
+	fi
+
 	query_dir="${DOWNLOAD_CACHE_BASE}/query_$(sanitize_name "${cache_mirror_key}_${download_repo}_${download_tag}_${arch_name}_${scope}")"
 	json_file="${query_dir}/release.json"
 	mkdir -p "$query_dir"
@@ -1490,6 +1762,18 @@ EOF
 			write_download_state "$state_file" "downloading" "downloading release asset (${candidate_mirror})" "$asset_name" "$release_tag" "$arch_name" ""
 			log_download "selected asset ${asset_name} mirror=${candidate_mirror} url=${asset_url}"
 
+		# Compute the upstream checksum (if published) and keep it for the
+		# POST-DOWNLOAD integrity check below. The pre-download "skip when local
+		# SHA256 matches upstream" optimization was intentionally removed: the
+		# locally installed binary is normally UPX-compressed while the upstream
+		# asset is uncompressed, so their SHA256 can never match. The decision to
+		# skip downloading is now made earlier and is based purely on whether the
+		# binaries already exist by name in /usr/bin.
+		checksum_url="$(release_checksum_asset_url "$json_file" "$asset_name")"
+		expected_sha=""
+		[ -n "$checksum_url" ] && expected_sha="$(fetch_release_sha256 "$checksum_url" "$asset_name")"
+		[ -n "$expected_sha" ] && log_download "上游发布校验和 ${expected_sha}，将在下载后验证完整性"
+
 			if cache_bundle_ready "$extracted_dir"; then
 				log_download "cached bundle found, reuse ${extracted_dir} mirror=${candidate_mirror}"
 				write_download_state "$state_file" "cached" "reusing local cached bundle" "$(basename "$cache_dir")" "$release_tag" "$arch_name" "$extracted_dir"
@@ -1528,6 +1812,16 @@ EOF
 				log_download "asset download ok tool=${DOWNLOAD_LAST_TOOL:-unknown} used_url=${DOWNLOAD_LAST_URL:-unknown} mirror=${candidate_mirror} file=${asset_file}"
 			fi
 
+			if [ -n "$expected_sha" ]; then
+				downloaded_sha="$(sha256_of "$asset_file")"
+				if [ -n "$downloaded_sha" ] && [ "$downloaded_sha" != "$expected_sha" ]; then
+					log_download "下载文件 SHA256 校验失败 (期望 ${expected_sha}, 实际 ${downloaded_sha})，丢弃并重试其他镜像"
+					rm -f "$asset_file"
+					break
+				fi
+				[ -n "$downloaded_sha" ] && log_download "下载文件 SHA256 校验通过 (${downloaded_sha})"
+			fi
+
 			write_download_state "$state_file" "extracting" "extracting program files (${candidate_mirror})" "$asset_name" "$release_tag" "$arch_name" ""
 			if ! extract_release_asset "$asset_file" "$extracted_dir"; then
 				log_download "extract failed, remove cache and switch mirror ${candidate_mirror} ${asset_file}"
@@ -1552,6 +1846,23 @@ EOF
 				log_download "bundle binaries are not valid ELF files mirror=${candidate_mirror}"
 				rm -rf "$extracted_dir"
 				continue
+			fi
+			# If the extracted binary is byte-identical (SHA256) to the already
+			# installed one, there is no need to overwrite it.
+			installed_cli="${INSTALL_BIN_DIR}/vnt2_cli"
+			if [ -f "$installed_cli" ] && is_elf_binary "$installed_cli" && [ -f "$cli_bin" ]; then
+				extracted_sha="$(sha256_of "$cli_bin")"
+				local_sha="$(sha256_of "$installed_cli")"
+				if [ -n "$extracted_sha" ] && [ "$extracted_sha" = "$local_sha" ]; then
+					log_download "解压出的 vnt2_cli 与已安装程序 SHA256 一致，跳过覆盖安装"
+					write_download_state "$state_file" "success" "已安装程序与下载内容一致，无需覆盖" "$asset_name" "$release_tag" "$arch_name" "$installed_cli"
+					write_version_state "$release_tag" "download-skip" "$arch_name" "$asset_name" "$installed_cli" "${INSTALL_BIN_DIR}/vnt2_ctrl" || \
+						log_download "failed to persist version state tag=${release_tag}"
+					uci -q set "${CONF}.${cfg}.vnt2_cli_bin=${INSTALL_BIN_DIR}/vnt2_cli"
+					uci -q set "${CONF}.${cfg}.vnt2_ctrl_bin=${INSTALL_BIN_DIR}/vnt2_ctrl"
+					uci commit "$CONF" >/dev/null 2>&1
+					return 0
+				fi
 			fi
 			if ! install_bundle_to_usrbin "$extracted_dir"; then
 				log_download "install bundle to /usr/bin failed"

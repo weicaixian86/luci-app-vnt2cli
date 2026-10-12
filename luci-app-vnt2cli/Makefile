@@ -12,7 +12,7 @@ PKG_RELEASE:=1
 
 LUCI_TITLE:=luci-app-vnt2cli - LuCI support for VNT2 CLI
 LUCI_DESCRIPTION:=luci-app-vnt2cli OpenWrt LuCI application for managing the VNT2 command line client vnt2_cli and its control tool vnt2_ctrl
-LUCI_DEPENDS:=+luci-base +luci-compat +kmod-tun +curl +ca-bundle +unzip +jsonfilter
+LUCI_DEPENDS:=+luci-base +luci-compat +kmod-tun +curl +ca-bundle +unzip +upx +jsonfilter
 LUCI_PKGARCH:=all
 
 define Package/$(PKG_NAME)/conffiles
