@@ -6,6 +6,10 @@ CLAIMED_FILE="${VNT2_UPLOAD_CLAIMED_FILE:-/etc/vnt2/upload.claimed}"
 UPLOAD_DIR="${VNT2_UPLOAD_DIR:-/etc/vnt2/upload}"
 DOWNLOAD_LOG="${VNT2_UPLOAD_LOG_FILE:-/tmp/vnt2-download.log}"
 VNT2_FIXED_VERSION="${VNT2_FIXED_VERSION:-2.0.10}"
+# Pinned upx release for ensure_upx_binary(): a fixed tag, never a dynamic
+# latest-release query (forbidden by the pre-build validator). Bump this
+# single line to upgrade the self-fetched upx.
+UPX_FIXED_VERSION="4.2.4"
 DOWNLOAD_STATE="${VNT2_UPLOAD_STATE_FILE:-/tmp/vnt2-download-cli.state}"
 DOWNLOAD_EVENTS="${VNT2_UPLOAD_EVENTS:-/tmp/vnt2-download.events}"
 VERSION_STATE_FILE="${VNT2_VERSION_STATE_FILE:-/etc/config/vnt2-cli.version}"
@@ -384,23 +388,23 @@ ensure_upx_binary() {
 		return 1
 	}
 
-	upx_ver="v4.2.4"
+	# Resolve the PINNED upx release via the GitHub API. The version is pinned
+	# like VNT2_FIXED_VERSION: we never query the dynamic latest release (the
+	# pre-build validator forbids it). The API response gives us the real asset
+	# URLs; when it is unreachable we fall back to the conventional upstream
+	# asset names below.
+	upx_ver="$UPX_FIXED_VERSION"
 	api_json="$(mktemp /tmp/upx-rel.XXXXXX)"
-	if fetch_url "https://api.github.com/repos/upx/upx/releases/latest" "$api_json" 30; then
-		local v
-		v="$(grep -o '"tag_name"[^,}]*' "$api_json" 2>/dev/null | head -n1 | \
-			sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')"
-		[ -n "$v" ] && upx_ver="$v"
-	fi
+	fetch_url "https://api.github.com/repos/upx/upx/releases/tags/v${upx_ver}" "$api_json" 30 || :
 
 	# Candidate asset URLs in priority order: the exact URL advertised by the
-	# release API first (robust against upstream asset renames), then the
-	# conventional upstream names as fallback (in case the API was blocked).
+	# pinned release API first (robust against upstream asset renames), then
+	# the conventional upstream names as fallback (in case the API was blocked).
 	candidates="$(select_upx_asset_url "$api_json" "$upx_arch")"
 	rm -f "$api_json"
 	for candidate in \
-		"https://github.com/upx/upx/releases/download/${upx_ver}/upx-${upx_ver#v}-${upx_arch}_linux.tar.xz" \
-		"https://github.com/upx/upx/releases/download/${upx_ver}/upx-${upx_ver#v}-${upx_arch}.tar.xz"
+		"https://github.com/upx/upx/releases/download/v${upx_ver}/upx-${upx_ver}-${upx_arch}_linux.tar.xz" \
+		"https://github.com/upx/upx/releases/download/v${upx_ver}/upx-${upx_ver}-${upx_arch}.tar.xz"
 	do
 		case "$candidates" in
 			*"$candidate"*) ;;
@@ -451,7 +455,7 @@ ${candidate}" ;;
 	chmod 755 /usr/bin/upx >/dev/null 2>&1
 	rm -rf "$work_dir"
 	log_worker "已自动下载并安装 upx 静态二进制"
-	log_event "upx_installed" "arch=${upx_arch} version=${upx_ver#v}"
+	log_event "upx_installed" "arch=${upx_arch} version=${upx_ver}"
 	command -v upx >/dev/null 2>&1
 }
 

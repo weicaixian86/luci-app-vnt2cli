@@ -52,6 +52,10 @@ DOWNLOAD_EVENTS="/tmp/vnt2-download.events"
 VERSION_STATE_FILE="/etc/config/vnt2-cli.version"
 VNT2_FIXED_REPO="vnt-dev/vnt"
 VNT2_FIXED_VERSION="2.0.10"
+# Pinned upx release for ensure_upx_binary(): like the vnt2 pin above this is
+# a fixed tag (never a dynamic latest-release query, which the pre-build
+# validator forbids). Bump this single line to upgrade the self-fetched upx.
+UPX_FIXED_VERSION="4.2.4"
 GH_PROXY_PREFIX="https://gh-proxy.com/"
 DOWNLOAD_MIRROR_RETRIES=3
 RESTART_PENDING_FILE="/tmp/vnt2-restart.pending"
@@ -916,25 +920,25 @@ ensure_upx_binary() {
 		return 1
 	}
 
-	# Resolve the latest upx release tag via the GitHub API (through the mirror
-	# chain). Fall back to a known-good version if the API is unreachable.
+	# Resolve the PINNED upx release via the GitHub API (through the mirror
+	# chain). The version is pinned like VNT2_FIXED_VERSION above: we never
+	# query the dynamic latest release (the pre-build validator forbids it).
+	# The API response gives us the real asset URLs; when it is unreachable we
+	# fall back to the conventional upstream asset names below.
+	upx_ver="$UPX_FIXED_VERSION"
 	json_file="$(mktemp /tmp/upx-rel.XXXXXX)"
-	api_url="https://api.github.com/repos/upx/upx/releases/latest"
-	if download_file "$api_url" "$json_file" "api" "gh-proxy" || \
-	   download_file "$api_url" "$json_file" "api" "github"; then
-		upx_ver="$(grep -o '"tag_name"[^,}]*' "$json_file" 2>/dev/null | head -n1 | \
-			sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')"
-	fi
-	[ -n "$upx_ver" ] || upx_ver="v4.2.4"
+	api_url="https://api.github.com/repos/upx/upx/releases/tags/v${upx_ver}"
+	download_file "$api_url" "$json_file" "api" "gh-proxy" || \
+		download_file "$api_url" "$json_file" "api" "github" || :
 
 	# Candidate asset URLs in priority order: the exact URL advertised by the
-	# release API first (robust against upstream asset renames), then the
-	# conventional upstream names as fallback (in case the API was blocked).
+	# pinned release API first (robust against upstream asset renames), then
+	# the conventional upstream names as fallback (in case the API was blocked).
 	candidates="$(select_upx_asset_url "$json_file" "$upx_arch")"
 	rm -f "$json_file"
 	for candidate in \
-		"https://github.com/upx/upx/releases/download/${upx_ver}/upx-${upx_ver#v}-${upx_arch}_linux.tar.xz" \
-		"https://github.com/upx/upx/releases/download/${upx_ver}/upx-${upx_ver#v}-${upx_arch}.tar.xz"
+		"https://github.com/upx/upx/releases/download/v${upx_ver}/upx-${upx_ver}-${upx_arch}_linux.tar.xz" \
+		"https://github.com/upx/upx/releases/download/v${upx_ver}/upx-${upx_ver}-${upx_arch}.tar.xz"
 	do
 		case "$candidates" in
 			*"$candidate"*) ;;
@@ -990,7 +994,7 @@ ${candidate}" ;;
 	chmod 755 /usr/bin/upx >/dev/null 2>&1
 	rm -rf "$work_dir"
 	log_download "已自动下载并安装 upx 静态二进制 ($(upx --version 2>/dev/null | head -n1))"
-	log_event "upx_installed" "arch=${upx_arch} version=${upx_ver#v}"
+	log_event "upx_installed" "arch=${upx_arch} version=${upx_ver}"
 	command -v upx >/dev/null 2>&1
 }
 
