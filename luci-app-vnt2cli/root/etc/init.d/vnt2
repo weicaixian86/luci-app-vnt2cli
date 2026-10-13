@@ -891,14 +891,90 @@ EOF
 	return 1
 }
 
+# Locate the SHA-256 published for one specific asset inside a checksum file
+# or a release-notes block.
+#
+# Two layouts occur in the wild:
+#   A) "<hash>  <asset>" / "<asset>: <hash>"  - digest on the same line
+#   B) release notes     - "<asset>" alone on a line, "sha256:<hex>" on the
+#                          NEXT line
+#
+# The asset name MUST be matched as a delimited word, not as a substring.
+# "vnt2-x86_64-...zip" is a prefix of "vnt2-x86_64-...zip.sha256", and the
+# digest listed under the latter belongs to the checksum file itself, not to
+# the archive. Pairing the archive with that digest rejected every correct
+# download, which is exactly how the plugin ended up unable to start.
+#
+# Implemented in awk rather than grep because the digest is read from a
+# look-ahead window (layout B). The 64-hex run is counted by hand so we do
+# not depend on ERE interval expressions ({64}), which are not reliably
+# supported by the BusyBox awk shipped on OpenWrt.
+extract_asset_sha256() {
+	local file="$1"
+	local name="$2"
+
+	awk -v name="$name" '
+	function isdelim(c) {
+		return c == "" || c == " " || c == "\t" || c == "\r" || c == ":" || \
+		       c == "*" || c == "(" || c == ")" || c == "[" || c == "]" || \
+		       c == "|" || c == "\\" || c == "/" || c == "," || c == ";" || \
+		       c == "\"" || c == "<" || c == ">"
+	}
+	function names(line,   p, before, after) {
+		p = index(line, name)
+		if (p == 0) return 0
+		before = (p == 1) ? "" : substr(line, p - 1, 1)
+		after = substr(line, p + length(name), 1)
+		return isdelim(before) && isdelim(after)
+	}
+	function grab(line,   i, c, run, n) {
+		run = ""
+		n = length(line)
+		for (i = 1; i <= n + 1; i++) {
+			c = substr(line, i, 1)
+			if (c ~ /[0-9a-fA-F]/) { run = run c; continue }
+			if (length(run) == 64) return run
+			run = ""
+		}
+		return ""
+	}
+	{ L[NR] = $0 }
+	END {
+		# Pass A: asset and digest on the same line.
+		for (i = 1; i <= NR; i++) {
+			if (!names(L[i])) continue
+			h = grab(L[i])
+			if (h != "") { print h; exit }
+		}
+		# Pass B: asset on its own line, digest within the next two lines.
+		for (i = 1; i <= NR; i++) {
+			if (!names(L[i])) continue
+			for (j = i + 1; j <= i + 2 && j <= NR; j++) {
+				h = grab(L[j])
+				if (h != "") { print h; exit }
+			}
+		}
+	}
+	' "$file" 2>/dev/null
+}
+
 fetch_release_sha256() {
 	local checksum_url="$1"
 	local asset_name="$2"
-	local tmp sum
+	local tmp sum count
 	tmp="$(mktemp "${TMPDIR:-/tmp}/vnt2sum.XXXXXX" 2>/dev/null)" || return 1
 	if download_file "$checksum_url" "$tmp" "checksum" "auto"; then
-		sum="$(grep -E "$asset_name" "$tmp" 2>/dev/null | grep -Eo '[0-9a-fA-F]{64}' | head -n1)"
-		[ -z "$sum" ] && sum="$(grep -Eo '[0-9a-fA-F]{64}' "$tmp" 2>/dev/null | head -n1)"
+		sum="$(extract_asset_sha256 "$tmp" "$asset_name")"
+		# Layout C: a dedicated per-asset .sha256 file carrying only the
+		# digest. Trust it only when it is genuinely the sole digest in the
+		# file: a multi-entry checksums file means we failed to locate our
+		# asset, and guessing would pair it with an unrelated artifact.
+		# Returning nothing is safe here - the download simply runs without
+		# a checksum gate - whereas a wrong digest bricks the install.
+		if [ -z "$sum" ]; then
+			count="$(grep -Eo '[0-9a-fA-F]{64}' "$tmp" 2>/dev/null | wc -l | tr -d ' ')"
+			[ "${count:-0}" = "1" ] && sum="$(grep -Eo '[0-9a-fA-F]{64}' "$tmp" 2>/dev/null | head -n1)"
+		fi
 	fi
 	rm -f "$tmp"
 	[ -n "$sum" ] && echo "$sum"
@@ -1509,7 +1585,30 @@ get_release_api_candidates() {
 
 extract_release_urls() {
 	local json_file="$1"
+	local filtered
 
+	# Prefer genuine download assets. A blanket https:// sweep also grabs
+	# descriptive URLs (release html_url, project homepage); on Gitee/GitLab
+	# those were accepted as "assets", yielding a bogus URL assembled from the
+	# release notes and a guaranteed download failure (curl exit 3).
+	grep -o '"browser_download_url"[[:space:]]*:[[:space:]]*"[^"]*"' "$json_file" 2>/dev/null | \
+		sed 's#\\/#/#g' | \
+		sed 's#^.*:[[:space:]]*"##; s#"$##' | \
+		awk 'NF && !seen[$0]++' | grep . && return 0
+
+	# Fallback for mirrors that publish assets under a different field
+	# (GitLab uses assets.links[].url, with no browser_download_url).
+	# A raw https:// sweep also picks up descriptive URLs from the release
+	# notes; those were accepted as "assets" and produced a bogus URL
+	# assembled from the notes text, which then failed with curl exit 3.
+	# Keep only URLs that actually name a build artifact.
+	filtered="$(grep -o 'https://[^"]*' "$json_file" 2>/dev/null | \
+		sed 's#\\/#/#g' | awk 'NF && !seen[$0]++' | \
+		grep -E '\.(zip|tar\.gz|tgz|tar\.xz|tar\.bz2|sha256|sha512|txt)([?]|$)')"
+	[ -n "$filtered" ] && { echo "$filtered"; return 0; }
+
+	# Last resort: nothing looked like an artifact, so hand back the raw sweep
+	# rather than degrade a mirror that used to work.
 	grep -o 'https://[^"]*' "$json_file" 2>/dev/null | \
 		sed 's#\\/#/#g' | awk 'NF && !seen[$0]++'
 }
@@ -1706,6 +1805,7 @@ select_release_asset() {
 	local version="$3"
 	local arch_name="$4"
 	local urls url filename arch_token arch_pat abi_token
+	local pass
 
 	urls="$(extract_release_urls "$json_file")"
 	[ -n "$urls" ] || return 1
@@ -1723,24 +1823,60 @@ select_release_asset() {
 	esac
 	[ -n "$arch_pat" ] || return 1
 
-	while IFS= read -r url; do
-		[ -n "$url" ] || continue
-		filename="${url##*/}"
-		filename="${filename%%\?*}"
-		case "$filename" in
-			*.sha256|*.sha512|*.md5|*.txt|*checksum*|*.sig|*.asc)
-				continue
-				;;
-		esac
-		echo "$filename" | grep -Eq -- "$arch_pat" || continue
-		if [ -n "$abi_token" ]; then
-			echo "$filename" | grep -Eq -- "$(arch_token_regex "$abi_token")" || continue
-		fi
-		echo "$url"
-		return 0
-	done <<EOF
+	# Three passes, most specific first. Matching the architecture token alone
+	# is not enough, for two reasons seen in the wild:
+	#   - vnt-jni-<arch>.so (an Android JNI library) sorts before the real CLI
+	#     archive and matched the arch token first; it can never be extracted.
+	#   - one arch ships several platform bundles (apple-darwin,
+	#     pc-windows-msvc, unknown-freebsd, unknown-linux-musl), so a plain
+	#     arch match can hand us another OS's binary.
+	# Pass 1 = musl Linux build (what OpenWrt/iStoreOS runs), pass 2 = any
+	# Linux build, pass 3 = any archive for this arch (last-resort fallback).
+	pass=1
+	while [ "$pass" -le 3 ]; do
+		while IFS= read -r url; do
+			[ -n "$url" ] || continue
+			filename="${url##*/}"
+			filename="${filename%%\?*}"
+			case "$filename" in
+				*.sha256|*.sha512|*.md5|*.txt|*checksum*|*.sig|*.asc)
+					continue
+					;;
+			esac
+			# The CLI bundle is always an archive; this alone rules out the
+			# .so/.exe/.msi artifacts.
+			case "$filename" in
+				*.zip|*.tar.gz|*.tgz|*.tar.xz|*.tar.bz2) : ;;
+				*) continue ;;
+			esac
+			echo "$filename" | grep -Eq -- "$arch_pat" || continue
+			if [ -n "$abi_token" ]; then
+				echo "$filename" | grep -Eq -- "$(arch_token_regex "$abi_token")" || continue
+			fi
+			# Platform gate: never accept another operating system's bundle.
+			case "$filename" in
+				*darwin*|*apple*|*windows*|*msvc*|*freebsd*|*android*|*ios*)
+					continue
+					;;
+			esac
+			if [ "$pass" -eq 1 ]; then
+				case "$filename" in
+					*linux*musl*|*musl*linux*) : ;;
+					*) continue ;;
+				esac
+			elif [ "$pass" -eq 2 ]; then
+				case "$filename" in
+					*linux*) : ;;
+					*) continue ;;
+				esac
+			fi
+			echo "$url"
+			return 0
+		done <<EOF
 $urls
 EOF
+		pass=$((pass + 1))
+	done
 
 	return 1
 }
@@ -2182,7 +2318,11 @@ EOF
 				continue
 			}
 
-			asset_name="$(basename "$asset_url")"
+			# Strip any query string before deriving the name: it would otherwise
+		# end up in the asset name and break both the checksum-file lookup and
+		# the on-disk cache path. The URL itself keeps its query (signed CDN
+		# links need it).
+		asset_name="$(basename "${asset_url%%\?*}")"
 			asset_file="${cache_dir}/${asset_name}"
 			write_download_state "$state_file" "downloading" "downloading release asset (${candidate_mirror})" "$asset_name" "$release_tag" "$arch_name" ""
 			log_download "selected asset ${asset_name} mirror=${candidate_mirror} url=${asset_url}"
