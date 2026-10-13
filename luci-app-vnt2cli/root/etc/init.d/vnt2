@@ -1001,6 +1001,63 @@ is_upx_compressed() {
 	return 1
 }
 
+# ---- Binary swap / rollback helpers for reconcile_upx_state() ----------------
+# The reconciler removes the binaries so the download path re-fetches them in the
+# form the user selected. Deleting them outright is unsafe: if the re-download
+# then fails (network down, all mirrors unreachable) the device would be left
+# with NO executable and the plugin could never start again. So we move them
+# aside first and roll back on failure.
+UPX_BACKUP_SUFFIX=".upxbak"
+UPX_ROLLBACK_CLI=""
+UPX_ROLLBACK_CTRL=""
+
+# Move the current binaries aside so the download path below re-fetches them.
+# Only called when a re-fetch is actually possible (auto download enabled, and
+# upx available when compression is wanted).
+backup_and_remove_binaries() {
+	local cli="$1"
+	local ctrl="$2"
+
+	UPX_ROLLBACK_CLI=""
+	UPX_ROLLBACK_CTRL=""
+	if [ -f "$cli" ]; then
+		mv -f "$cli" "${cli}${UPX_BACKUP_SUFFIX}" 2>/dev/null && \
+			UPX_ROLLBACK_CLI="${cli}${UPX_BACKUP_SUFFIX}"
+	fi
+	if [ -f "$ctrl" ]; then
+		mv -f "$ctrl" "${ctrl}${UPX_BACKUP_SUFFIX}" 2>/dev/null && \
+			UPX_ROLLBACK_CTRL="${ctrl}${UPX_BACKUP_SUFFIX}"
+	fi
+	# The recorded version state now points at files that no longer exist; drop
+	# it, otherwise fixed_binary_state_matches() could keep reporting the old
+	# binary as "already installed".
+	clear_version_state
+}
+
+# Re-download + install succeeded: the moved-aside copies are no longer needed.
+discard_binary_backup() {
+	rm -f "${INSTALL_BIN_DIR}/vnt2_cli${UPX_BACKUP_SUFFIX}" \
+	      "${INSTALL_BIN_DIR}/vnt2_ctrl${UPX_BACKUP_SUFFIX}" 2>/dev/null
+	UPX_ROLLBACK_CLI=""
+	UPX_ROLLBACK_CTRL=""
+}
+
+# Re-download failed: put the originals back so the plugin can still start.
+restore_binary_backup() {
+	local restored=0
+	if [ -n "$UPX_ROLLBACK_CLI" ] && [ -f "$UPX_ROLLBACK_CLI" ]; then
+		mv -f "$UPX_ROLLBACK_CLI" "${INSTALL_BIN_DIR}/vnt2_cli" 2>/dev/null && restored=1
+	fi
+	if [ -n "$UPX_ROLLBACK_CTRL" ] && [ -f "$UPX_ROLLBACK_CTRL" ]; then
+		mv -f "$UPX_ROLLBACK_CTRL" "${INSTALL_BIN_DIR}/vnt2_ctrl" 2>/dev/null
+	fi
+	if [ "$restored" = "1" ]; then
+		log_download "重新下载失败，已回滚原有二进制程序（插件可继续使用原程序启动）"
+	fi
+	UPX_ROLLBACK_CLI=""
+	UPX_ROLLBACK_CTRL=""
+}
+
 # Reconcile the on-disk binary's compression state with the user's setting so that
 # toggling "启用 UPX 压缩" actually takes effect without a manual reinstall:
 #   - compression OFF but a binary is currently UPX-packed  -> delete it so the
@@ -1010,8 +1067,10 @@ is_upx_compressed() {
 #     to avoid re-downloading in a loop when upx cannot be obtained on this arch.)
 # Deleting the files simply defeats the "skip-download" gate (which only checks for
 # the binaries' presence); the subsequent download reinstalls them in the desired form.
+# $1 = want_compress ("1" = 压缩开启), $2 = can_refetch ("1" = 删除后能重新下载)
 reconcile_upx_state() {
 	local want_compress="$1"
+	local can_refetch="${2:-1}"
 	local cli="${INSTALL_BIN_DIR}/vnt2_cli"
 	local ctrl="${INSTALL_BIN_DIR}/vnt2_ctrl"
 	local cli_c ctrl_c
@@ -1025,13 +1084,16 @@ reconcile_upx_state() {
 			# Only re-fetch when we can actually compress; otherwise we would
 			# delete+redownload+stay-uncompressed on every download action.
 			upx_is_usable || return 0
+			# Never remove binaries we cannot re-download (auto download off).
+			[ "$can_refetch" = "1" ] || return 0
 			log_download "压缩已启用但现有程序未压缩，将重新下载并压缩"
-			rm -f "$cli" "$ctrl" 2>/dev/null
+			backup_and_remove_binaries "$cli" "$ctrl"
 		fi
 	else
 		if [ "$cli_c" = "1" ] || [ "$ctrl_c" = "1" ]; then
+			[ "$can_refetch" = "1" ] || return 0
 			log_download "压缩已关闭但现有程序仍为压缩版，将删除并重新下载未压缩程序"
-			rm -f "$cli" "$ctrl" 2>/dev/null
+			backup_and_remove_binaries "$cli" "$ctrl"
 		fi
 	fi
 }
@@ -2015,7 +2077,7 @@ auto_download_bundle_for_mode() {
 	# Reconcile compression state BEFORE the skip gate: if the user toggled
 	# compression, delete the on-disk binary so the download below re-fetches it
 	# in the desired (compressed/uncompressed) form instead of skipping.
-	reconcile_upx_state "$VNT2_UPX_COMPRESS"
+	reconcile_upx_state "$VNT2_UPX_COMPRESS" "1"
 
 	# Skip-download gate: the upstream asset is an UNCOMPRESSED original, while
 	# the locally installed binary may be UPX-compressed. Their SHA256 can never
@@ -2274,17 +2336,43 @@ prepare_binary() {
 	local state_file="$5"
 	local scope="$6"
 
-	local bin managed_binary_needs_update=0 auto_download
+	local bin managed_binary_needs_update=0 auto_download upx_compress
 	config_get bin "$cfg" "$option" "$default_path"
 
-	case "$scope" in
+		case "$scope" in
 		cli)
+			config_get_bool auto_download "$cfg" "auto_download" "1"
+			config_get_bool upx_compress "$cfg" "upx_compress" "0"
+			# Drop leftovers from an interrupted previous run (the backup is
+			# created by mv, so anything found here predates this invocation).
+			# Without this, a crash between backup and cleanup would leave
+			# vnt2_cli.upxbak occupying flash forever.
+			rm -f "${INSTALL_BIN_DIR}/vnt2_cli${UPX_BACKUP_SUFFIX}" \
+			      "${INSTALL_BIN_DIR}/vnt2_ctrl${UPX_BACKUP_SUFFIX}" 2>/dev/null
+			# When compression is requested, get upx ready BEFORE reconciling.
+			# The reconciler only removes binaries if it can actually compress
+			# them (upx_is_usable); on x86_64 the bundled static binary satisfies
+			# that instantly, but on other architectures upx must be installed by
+			# the distro package manager first — otherwise the reconciler would
+			# see "upx unusable", skip the removal, and the shortcut below would
+			# then report "already installed", so the packed binary would never
+			# be fetched. ensure_runtime_deps() (which also handles curl/wget/
+			# unzip) runs later, inside the download path.
+			if [ "$upx_compress" = "1" ] && [ "$auto_download" = "1" ]; then
+				upx_is_usable || ensure_upx_binary
+			fi
+			# Compression-state reconciliation MUST run before the
+			# fixed_binary_state_matches() shortcut below. A UPX-packed binary is
+			# still a valid ELF, and the version state records the mtime/size of
+			# whatever was installed last (i.e. the packed binary), so the
+			# shortcut would report "already installed" and the binary would
+			# never be re-fetched in the form the user selected.
+			reconcile_upx_state "$upx_compress" "$auto_download"
 			if ensure_elf_exec "$bin"; then
 				if fixed_binary_state_matches "$bin"; then
 					echo "$bin"
 					return 0
 				fi
-				config_get_bool auto_download "$cfg" "auto_download" "1"
 				if [ "$auto_download" = "1" ]; then
 					managed_binary_needs_update=1
 					log_download "installed ${scope} binary is not the fixed version ${VNT2_FIXED_VERSION}, attempting replacement"
@@ -2302,10 +2390,19 @@ prepare_binary() {
 	if auto_download_bundle "$cfg" "$scope" "$state_file"; then
 		bin="$(uci -q get "${CONF}.${cfg}.${option}")"
 		if ensure_elf_exec "$bin"; then
+			# Only drop the backup once the NEW binary is confirmed usable. If we
+			# discarded it earlier, a "successful" download that produced an
+			# unusable file would leave nothing to roll back to.
+			discard_binary_backup
 			echo "$bin"
 			return 0
 		fi
 	fi
+
+	# The reconciler only moves binaries aside when it can re-fetch them; if the
+	# re-download failed anyway, restore the originals so the plugin can still
+	# start instead of being left without an executable.
+	restore_binary_backup
 
 	# Manual uploads are staged by LuCI and installed asynchronously by
 	# /usr/libexec/vnt2/upload-worker, which also points vnt2_cli_bin at
