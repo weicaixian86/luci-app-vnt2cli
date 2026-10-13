@@ -133,7 +133,9 @@ check_free_space() {
 detect_file_magic() {
 	local f="$1" magic
 	[ -s "$f" ] || { echo "unknown"; return; }
-	magic="$(dd if="$f" bs=1 count=4 2>/dev/null | od -An -tx1 | tr -dc '0-9a-fA-F')"
+	# Read 6 bytes: xz's magic is fd 37 7a 58 5a 00, so a 4-byte read can never
+	# match it. elf/gz/zip magics are all <= 4 bytes and still match by prefix.
+	magic="$(dd if="$f" bs=1 count=6 2>/dev/null | od -An -tx1 | tr -dc '0-9a-fA-F')"
 	case "$magic" in
 		7f454c46*) echo "elf" ;;
 		1f8b*)     echo "gz" ;;
@@ -159,6 +161,101 @@ classify_archive() {
 		*.tar.xz|*.txz) echo "tar.xz" ;;
 		*) echo "unknown" ;;
 	esac
+}
+
+# Decompress an xz/gz stream to a plain file, trying every decompressor the
+# device may provide. Some BusyBox builds ship `tar` without xz (or gzip)
+# support even when a standalone xz-utils binary exists on the device, so the
+# native tar flag alone is not enough. Returns 1 when no decompressor is
+# available or the data is corrupt.
+decompress_to_file() {
+	local kind="$1" src="$2" dst="$3"
+
+	[ -s "$src" ] || return 1
+	case "$kind" in
+		xz|tar.xz)
+			if command -v xz >/dev/null 2>&1; then
+				xz -dc "$src" >"$dst" 2>/dev/null && [ -s "$dst" ] && return 0
+			fi
+			if command -v xzcat >/dev/null 2>&1; then
+				xzcat "$src" >"$dst" 2>/dev/null && [ -s "$dst" ] && return 0
+			fi
+			if command -v unxz >/dev/null 2>&1; then
+				unxz -c "$src" >"$dst" 2>/dev/null && [ -s "$dst" ] && return 0
+			fi
+		;;
+		gz|tar.gz)
+			if command -v gzip >/dev/null 2>&1; then
+				gzip -dc "$src" >"$dst" 2>/dev/null && [ -s "$dst" ] && return 0
+			fi
+			if command -v gunzip >/dev/null 2>&1; then
+				gunzip -c "$src" >"$dst" 2>/dev/null && [ -s "$dst" ] && return 0
+			fi
+			if command -v busybox >/dev/null 2>&1; then
+				busybox gunzip -c "$src" >"$dst" 2>/dev/null && [ -s "$dst" ] && return 0
+			fi
+		;;
+	esac
+	rm -f "$dst" 2>/dev/null
+	return 1
+}
+
+# List the entries of a tar.gz/tar.xz archive (pass "v" as the third argument
+# for the verbose listing). Tries the native tar flag first, then falls back to
+# an external decompressor plus plain tar. This is what keeps .tar.xz assets
+# (such as the self-fetched upx release) unpackable on minimal firmwares.
+tar_list_entries() {
+	local kind="$1" f="$2" verbose="${3:-}"
+	local out tmp rc vopt="" flag=""
+
+	case "$verbose" in
+		v) vopt="v" ;;
+	esac
+	case "$kind" in
+		tar.gz) flag="z" ;;
+		tar.xz) flag="J" ;;
+		*) return 1 ;;
+	esac
+	out="$(tar -t${vopt}${flag}f "$f" 2>/dev/null)" && {
+		printf '%s\n' "$out"
+		return 0
+	}
+	tmp="$(mktemp /tmp/vnt2-tl.XXXXXX)" || return 1
+	if decompress_to_file "$kind" "$f" "$tmp"; then
+		out="$(tar -t${vopt}f "$tmp" 2>/dev/null)"
+		rc=$?
+		rm -f "$tmp"
+		[ "$rc" -eq 0 ] || return 1
+		printf '%s\n' "$out"
+		return 0
+	fi
+	rm -f "$tmp"
+	return 1
+}
+
+# Extract a tar.gz/tar.xz archive into dest_dir with the same fallback chain.
+tar_extract_entries() {
+	local kind="$1" f="$2" dest="$3"
+	local tmp rc flag=""
+
+	case "$kind" in
+		tar.gz) flag="z" ;;
+		tar.xz) flag="J" ;;
+		*) return 1 ;;
+	esac
+	mkdir -p "$dest" 2>/dev/null
+	if tar -x${flag}f "$f" -C "$dest" >/dev/null 2>&1; then
+		return 0
+	fi
+	tmp="$(mktemp /tmp/vnt2-tx.XXXXXX)" || return 1
+	if decompress_to_file "$kind" "$f" "$tmp"; then
+		tar -xf "$tmp" -C "$dest" >/dev/null 2>&1
+		rc=$?
+		rm -f "$tmp"
+		return $rc
+	fi
+	rm -f "$tmp"
+	return 1
 }
 
 # Post-install sanity check: actually execute the binary and confirm it runs,
@@ -429,8 +526,8 @@ ${candidate}" ;;
 
 	work_dir="$(mktemp -d /tmp/upx-work.XXXXXX)"
 	if ! extract_archive "$tarball" "$work_dir"; then
+		log_worker "解压 upx 失败 (类型=$(classify_archive "$tarball") 大小=$(wc -c <"$tarball" 2>/dev/null || echo '?')B；本机缺少 xz 解压能力或文件损坏)"
 		rm -rf "$work_dir"; rm -f "$tarball"
-		log_worker "解压 upx 失败"
 		return 1
 	fi
 	rm -f "$tarball"
@@ -569,15 +666,10 @@ tar_archive_is_safe() {
 
 	kind="$(classify_archive "$archive")"
 	case "$kind" in
-		tar.gz)
-			entries="$(tar -tzf "$archive" 2>/dev/null)" || return 1
+		tar.gz|tar.xz)
+			entries="$(tar_list_entries "$kind" "$archive")" || return 1
 			printf '%s\n' "$entries" | archive_paths_are_safe || return 1
-			details="$(tar -tvzf "$archive" 2>/dev/null)" || return 1
-		;;
-		tar.xz)
-			entries="$(tar -tJf "$archive" 2>/dev/null)" || return 1
-			printf '%s\n' "$entries" | archive_paths_are_safe || return 1
-			details="$(tar -tvJf "$archive" 2>/dev/null)" || return 1
+			details="$(tar_list_entries "$kind" "$archive" v)" || return 1
 		;;
 		*)
 			return 1
@@ -637,11 +729,11 @@ extract_archive() {
 			return 1
 		;;
 		tar.gz)
-			tar -xzf "$archive" -C "$dest_dir" >/dev/null 2>&1
+			tar_extract_entries tar.gz "$archive" "$dest_dir"
 			return $?
 		;;
 		tar.xz)
-			tar -xJf "$archive" -C "$dest_dir" >/dev/null 2>&1
+			tar_extract_entries tar.xz "$archive" "$dest_dir"
 			return $?
 		;;
 		elf|*)
@@ -846,7 +938,7 @@ process_claimed() {
 			if ! tar_archive_is_safe "$upload_path"; then
 				log_worker "upload rejected: unsafe or invalid tar.gz archive"
 				write_state "failed" "upload rejected: unsafe or invalid tar.gz archive" "$upload_asset" "" "$arch" ""
-			elif ! tar -xzf "$upload_path" -C "$work_dir" >/dev/null 2>&1; then
+			elif ! tar_extract_entries tar.gz "$upload_path" "$work_dir"; then
 				log_worker "upload rejected: archive extraction failed"
 				write_state "failed" "upload rejected: archive extraction failed" "$upload_asset" "" "$arch" ""
 			elif ! source_bin="$(locate_extracted_bin "$work_dir" "vnt2_cli")"; then
