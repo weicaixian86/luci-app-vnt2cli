@@ -403,6 +403,13 @@ ensure_runtime_deps_upload() {
 		log_worker "runtime install of wget failed or unavailable"
 	pm_install_pkg unzip >/dev/null 2>&1 || log_worker "runtime install of unzip failed or unavailable"
 	if [ "$VNT2_UPX_COMPRESS" = "1" ]; then
+		# The self-fetched upx release is a .tar.xz, so we need an xz
+		# decompressor to unpack it. xz is a common OpenWrt/iStoreOS package
+		# (unlike upx itself, which is missing from some feeds), so install it
+		# as a soft dependency; without xz the .tar.xz cannot be extracted.
+		command -v xz >/dev/null 2>&1 || command -v unxz >/dev/null 2>&1 || \
+			pm_install_pkg xz >/dev/null 2>&1 || \
+			log_worker "runtime install of xz failed or unavailable (upx 包为 tar.xz，解压需 xz)"
 		if command -v upx >/dev/null 2>&1; then
 			: # upx already available on the device
 		elif ensure_upx_binary; then
@@ -514,8 +521,14 @@ ${candidate}" ;;
 	for candidate in $candidates; do
 		[ -n "$candidate" ] || continue
 		if fetch_url "$candidate" "$tarball" 180; then
-			got=1
-			break
+			# Integrity guard: a mirror may return a truncated body or an HTML
+			# error page that still looks like a success. Reject anything that
+			# is not a real archive and try the next candidate instead of
+			# failing later at extraction with a confusing "corrupt" message.
+			case "$(detect_file_magic "$tarball")" in
+				xz|gz|zip) got=1; break ;;
+				*) rm -f "$tarball"; log_worker "下载的 upx 包格式异常(非压缩包)，尝试其它镜像" ;;
+			esac
 		fi
 	done
 	[ "$got" = "1" ] || {
