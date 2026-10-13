@@ -6,10 +6,6 @@ CLAIMED_FILE="${VNT2_UPLOAD_CLAIMED_FILE:-/etc/vnt2/upload.claimed}"
 UPLOAD_DIR="${VNT2_UPLOAD_DIR:-/etc/vnt2/upload}"
 DOWNLOAD_LOG="${VNT2_UPLOAD_LOG_FILE:-/tmp/vnt2-download.log}"
 VNT2_FIXED_VERSION="${VNT2_FIXED_VERSION:-2.0.10}"
-# Pinned upx release for ensure_upx_binary(): a fixed tag, never a dynamic
-# latest-release query (forbidden by the pre-build validator). Bump this
-# single line to upgrade the self-fetched upx.
-UPX_FIXED_VERSION="4.2.4"
 DOWNLOAD_STATE="${VNT2_UPLOAD_STATE_FILE:-/tmp/vnt2-download-cli.state}"
 DOWNLOAD_EVENTS="${VNT2_UPLOAD_EVENTS:-/tmp/vnt2-download.events}"
 VERSION_STATE_FILE="${VNT2_VERSION_STATE_FILE:-/etc/config/vnt2-cli.version}"
@@ -403,17 +399,17 @@ ensure_runtime_deps_upload() {
 		log_worker "runtime install of wget failed or unavailable"
 	pm_install_pkg unzip >/dev/null 2>&1 || log_worker "runtime install of unzip failed or unavailable"
 	if [ "$VNT2_UPX_COMPRESS" = "1" ]; then
-		# The self-fetched upx release is a .tar.xz, so we need an xz
-		# decompressor to unpack it. xz is a common OpenWrt/iStoreOS package
-		# (unlike upx itself, which is missing from some feeds), so install it
-		# as a soft dependency; without xz the .tar.xz cannot be extracted.
-		command -v xz >/dev/null 2>&1 || command -v unxz >/dev/null 2>&1 || \
-			pm_install_pkg xz >/dev/null 2>&1 || \
-			log_worker "runtime install of xz failed or unavailable (upx 包为 tar.xz，解压需 xz)"
-		if command -v upx >/dev/null 2>&1; then
-			: # upx already available on the device
+		# x86_64: the package bundles a static upx at /usr/bin/upx, already on
+		# PATH (no download). On any other arch ensure_upx_binary() asks the
+		# distro package manager (apk/opkg) for the correct-arch upx — no xz.
+		# NOTE: health-check (upx_is_usable), not a bare `command -v upx` — the
+		# bundled x86_64 binary is on PATH on every arch but cannot exec on a
+		# non-x86_64 device, so a bare check would short-circuit and leave
+		# compression silently broken.
+		if upx_is_usable; then
+			: # upx already available AND runs on this arch
 		elif ensure_upx_binary; then
-			log_worker "upx 静态二进制已自动下载并安装"
+			log_worker "upx 已自动安装（包管理器）"
 		else
 			log_worker "upx 不可用，将安装未压缩版本（功能不受影响）"
 		fi
@@ -451,122 +447,48 @@ fetch_url() {
 	return 1
 }
 
-# Map the detected device architecture to the upx release asset arch token.
-upx_arch_for_device() {
-	local a
-	a="$(detect_arch_name)"
-	case "$a" in
-		x86_64)      echo "amd64" ;;
-		aarch64)     echo "arm64" ;;
-		mipsel)      echo "mipsel" ;;
-		mips)        echo "mips" ;;
-		arm-*|armv7*) echo "arm" ;;
-		*)           echo "" ;;
-	esac
+# Map the detected device architecture to the Alpine Linux package arch token.
+# Alpine ships musl-linked upx packages that run on OpenWrt/iStoreOS, and the
+# .apk is gzip-compressed so it decompresses with gunzip (no xz, no glibc).
+# True only when an upx binary is on PATH AND it actually executes on this
+# device. The package bundles a static x86_64 upx for the common x86_64 case,
+# but on a non-x86_64 device `command -v upx` would still find that bundled
+# (wrong-arch) binary; we must exec-check it so the correct arch is fetched
+# instead of silently failing compression later with Exec format error.
+upx_is_usable() {
+	local p
+	p="$(command -v upx 2>/dev/null)"
+	[ -n "$p" ] && binary_health_check "$p"
 }
 
-# Print the release asset download URL for the given upx arch token from a
-# GitHub release API JSON file. Only linux tarballs are considered (Windows /
-# macOS / source archives are skipped). Prints nothing when nothing matches,
-# so callers can fall back to conventionally-named URLs.
-select_upx_asset_url() {
-	local json="$1" arch="$2"
-	[ -n "$json" ] && [ -f "$json" ] || return 1
-	grep -o '"browser_download_url"[[:space:]]*:[[:space:]]*"[^"]*"' "$json" 2>/dev/null | \
-		sed -E 's/.*"browser_download_url"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' | \
-		grep -E -- "[-._]${arch}([-_]linux)?\.tar\.xz$" | head -n1
-}
-
-# Path B: when the package manager cannot provide `upx`, fetch a statically-linked
-# upx release binary for this device architecture and install it to /usr/bin/upx.
-# Returns 1 on any failure so the caller installs the uncompressed binary instead.
-# The downloaded upx persists in overlay, so it is fetched at most once.
+# Path B (borrowed from luci-app-vnt2 1.7.2's pm_install idiom): make `upx`
+# available on THIS architecture by letting the distro package manager install
+# it — `apk add upx` on iStoreOS/Alpine, `opkg install upx` on OpenWrt. The PM
+# resolves the correct arch+libc automatically, so aarch64/armv7/x86 all get a
+# working upx with no per-arch code. The bundled x86_64 upx (fast/offline path)
+# is checked first via upx_is_usable(); we only reach the PM path on a non-x86_64
+# device. Returns 1 on failure so the caller installs the uncompressed binary.
+# The installed upx persists in overlay, fetched at most once.
 ensure_upx_binary() {
-	command -v upx >/dev/null 2>&1 && return 0
+	# Health-check, not a bare `command -v`: the bundled x86_64 upx is on PATH
+	# on every arch (the package is PKGARCH:=all), but it cannot exec on a
+	# non-x86_64 device. Treat only a running upx as "available".
+	upx_is_usable && return 0
 
-	local upx_arch api_json upx_ver tarball work_dir bin_found
-	local candidates candidate got=0
-	upx_arch="$(upx_arch_for_device)"
-	[ -n "$upx_arch" ] || {
-		log_worker "未识别的架构，跳过自动下载 upx"
-		return 1
-	}
-
-	# Resolve the PINNED upx release via the GitHub API. The version is pinned
-	# like VNT2_FIXED_VERSION: we never query the dynamic latest release (the
-	# pre-build validator forbids it). The API response gives us the real asset
-	# URLs; when it is unreachable we fall back to the conventional upstream
-	# asset names below.
-	upx_ver="$UPX_FIXED_VERSION"
-	api_json="$(mktemp /tmp/upx-rel.XXXXXX)"
-	fetch_url "https://api.github.com/repos/upx/upx/releases/tags/v${upx_ver}" "$api_json" 30 || :
-
-	# Candidate asset URLs in priority order: the exact URL advertised by the
-	# pinned release API first (robust against upstream asset renames), then
-	# the conventional upstream names as fallback (in case the API was blocked).
-	candidates="$(select_upx_asset_url "$api_json" "$upx_arch")"
-	rm -f "$api_json"
-	for candidate in \
-		"https://github.com/upx/upx/releases/download/v${upx_ver}/upx-${upx_ver}-${upx_arch}_linux.tar.xz" \
-		"https://github.com/upx/upx/releases/download/v${upx_ver}/upx-${upx_ver}-${upx_arch}.tar.xz"
-	do
-		case "$candidates" in
-			*"$candidate"*) ;;
-			*) candidates="${candidates}
-${candidate}" ;;
-		esac
-	done
-
-	tarball="$(mktemp /tmp/upx-dl.XXXXXX)"
-	for candidate in $candidates; do
-		[ -n "$candidate" ] || continue
-		if fetch_url "$candidate" "$tarball" 180; then
-			# Integrity guard: a mirror may return a truncated body or an HTML
-			# error page that still looks like a success. Reject anything that
-			# is not a real archive and try the next candidate instead of
-			# failing later at extraction with a confusing "corrupt" message.
-			case "$(detect_file_magic "$tarball")" in
-				xz|gz|zip) got=1; break ;;
-				*) rm -f "$tarball"; log_worker "下载的 upx 包格式异常(非压缩包)，尝试其它镜像" ;;
-			esac
-		fi
-	done
-	[ "$got" = "1" ] || {
-		rm -f "$tarball"
-		log_worker "自动下载 upx 静态二进制失败 (arch=${upx_arch})，将安装未压缩版本"
-		return 1
-	}
-
-	work_dir="$(mktemp -d /tmp/upx-work.XXXXXX)"
-	if ! extract_archive "$tarball" "$work_dir"; then
-		log_worker "解压 upx 失败 (类型=$(classify_archive "$tarball") 大小=$(wc -c <"$tarball" 2>/dev/null || echo '?')B；本机缺少 xz 解压能力或文件损坏)"
-		rm -rf "$work_dir"; rm -f "$tarball"
-		return 1
-	fi
-	rm -f "$tarball"
-
-	bin_found="$(find "$work_dir" -type f -name upx 2>/dev/null | head -n1)"
-	if [ -z "$bin_found" ] || ! is_elf_binary "$bin_found"; then
-		rm -rf "$work_dir"
-		log_worker "upx 压缩包内未找到有效的 upx 可执行文件"
-		return 1
-	fi
-	if ! "$bin_found" --version >/dev/null 2>&1; then
-		rm -rf "$work_dir"
-		log_worker "下载的 upx 无法在本机执行 (可能架构不匹配)"
-		return 1
+	# Let the distro provide upx for the current arch. pm_install_pkg resolves
+	# apk/opkg, is a no-op if upx is already present, and returns 0 only when
+	# `upx` ends up on PATH.
+	if pm_install_pkg upx >/dev/null 2>&1 && upx_is_usable; then
+		log_worker "已通过包管理器安装 upx ($(upx --version 2>/dev/null | head -n1))"
+		log_event "upx_installed" "method=pm"
+		return 0
 	fi
 
-	cp -f "$bin_found" /usr/bin/upx >/dev/null 2>&1 || {
-		rm -rf "$work_dir"
-		log_worker "安装 upx 到 /usr/bin 失败"
-		return 1
-	}
-	chmod 755 /usr/bin/upx >/dev/null 2>&1
-	rm -rf "$work_dir"
-	log_worker "已自动下载并安装 upx 静态二进制"
-	log_event "upx_installed" "arch=${upx_arch} version=${upx_ver}"
-	command -v upx >/dev/null 2>&1
+	# Unsupported/no-upx-feed: drop the dead bundled x86_64 binary (if present)
+	# so it does not masquerade as a working upx, then fall back to uncompressed.
+	[ "$(command -v upx 2>/dev/null)" = "/usr/bin/upx" ] && rm -f /usr/bin/upx 2>/dev/null
+	log_worker "无法通过包管理器获取 upx，将安装未压缩版本"
+	return 1
 }
 
 is_elf_binary() {
@@ -771,7 +693,7 @@ install_binary_atomic() {
 	}
 	# Compress with UPX when enabled (shrinks the on-disk binary). UPX rewrites
 	# the file in place and the result stays a valid ELF.
-	if [ "$VNT2_UPX_COMPRESS" = "1" ] && command -v upx >/dev/null 2>&1; then
+	if [ "$VNT2_UPX_COMPRESS" = "1" ] && upx_is_usable; then
 		if upx -q -q --force "$temp_path" >/dev/null 2>&1; then
 			log_worker "UPX compressed $(basename "$target")"
 		else

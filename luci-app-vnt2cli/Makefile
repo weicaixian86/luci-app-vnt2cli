@@ -63,7 +63,8 @@ chmod 0755 \
   "$${IPKG_INSTROOT}/etc/init.d/vnt2-upload-worker" \
   "$${IPKG_INSTROOT}/etc/init.d/vnt2-worker" \
   "$${IPKG_INSTROOT}/usr/libexec/vnt2/restart-worker" \
-  "$${IPKG_INSTROOT}/usr/libexec/vnt2/upload-worker" >/dev/null 2>&1
+  "$${IPKG_INSTROOT}/usr/libexec/vnt2/upload-worker" \
+  "$${IPKG_INSTROOT}/usr/bin/upx" >/dev/null 2>&1
 if [ -f /tmp/vnt2_backup ] ; then
   echo "发现 vnt2 备份配置文件 /tmp/vnt2_backup，开始恢复到 /etc/config/vnt2"
   mv -f /tmp/vnt2_backup /etc/config/vnt2
