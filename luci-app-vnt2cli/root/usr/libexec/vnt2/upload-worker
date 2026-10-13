@@ -1,5 +1,6 @@
 #!/bin/sh
 
+GH_PROXY_PREFIX="https://gh-proxy.com/"
 PENDING_FILE="${VNT2_UPLOAD_PENDING_FILE:-/etc/vnt2/upload.pending}"
 CLAIMED_FILE="${VNT2_UPLOAD_CLAIMED_FILE:-/etc/vnt2/upload.claimed}"
 UPLOAD_DIR="${VNT2_UPLOAD_DIR:-/etc/vnt2/upload}"
@@ -301,8 +302,157 @@ ensure_runtime_deps_upload() {
 		log_worker "runtime install of wget failed or unavailable"
 	pm_install_pkg unzip >/dev/null 2>&1 || log_worker "runtime install of unzip failed or unavailable"
 	if [ "$VNT2_UPX_COMPRESS" = "1" ]; then
-		pm_install_pkg upx >/dev/null 2>&1 || log_worker "runtime install of upx failed or unavailable"
+		if command -v upx >/dev/null 2>&1; then
+			: # upx already available on the device
+		elif ensure_upx_binary; then
+			log_worker "upx 静态二进制已自动下载并安装"
+		else
+			log_worker "upx 不可用，将安装未压缩版本（功能不受影响）"
+		fi
 	fi
+}
+
+# Minimal URL fetcher used by the UPX self-fetch (the upload-worker has no
+# shared download_file). Tries gh-proxy first, then the raw URL.
+fetch_url() {
+	local url="$1" out="$2" timeout="${3:-120}"
+	local downloader proxied raw_url
+
+	if command -v curl >/dev/null 2>&1; then
+		downloader="curl"
+	elif command -v wget >/dev/null 2>&1; then
+		downloader="wget"
+	else
+		return 1
+	fi
+	raw_url="$url"
+	proxied="${GH_PROXY_PREFIX}${url}"
+
+	for u in "$proxied" "$raw_url"; do
+		case "$downloader" in
+			curl)
+				curl -fsSL --connect-timeout 20 --max-time "$timeout" --retry 2 --retry-delay 5 \
+					-A "luci-app-vnt2cli" \
+					-o "$out" "$u" >/dev/null 2>&1 && return 0
+			;;
+			wget)
+				wget -q --timeout="$timeout" --tries=2 -O "$out" "$u" >/dev/null 2>&1 && return 0
+			;;
+		esac
+	done
+	return 1
+}
+
+# Map the detected device architecture to the upx release asset arch token.
+upx_arch_for_device() {
+	local a
+	a="$(detect_arch_name)"
+	case "$a" in
+		x86_64)      echo "amd64" ;;
+		aarch64)     echo "arm64" ;;
+		mipsel)      echo "mipsel" ;;
+		mips)        echo "mips" ;;
+		arm-*|armv7*) echo "arm" ;;
+		*)           echo "" ;;
+	esac
+}
+
+# Print the release asset download URL for the given upx arch token from a
+# GitHub release API JSON file. Only linux tarballs are considered (Windows /
+# macOS / source archives are skipped). Prints nothing when nothing matches,
+# so callers can fall back to conventionally-named URLs.
+select_upx_asset_url() {
+	local json="$1" arch="$2"
+	[ -n "$json" ] && [ -f "$json" ] || return 1
+	grep -o '"browser_download_url"[[:space:]]*:[[:space:]]*"[^"]*"' "$json" 2>/dev/null | \
+		sed -E 's/.*"browser_download_url"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' | \
+		grep -E -- "[-._]${arch}([-_]linux)?\.tar\.xz$" | head -n1
+}
+
+# Path B: when the package manager cannot provide `upx`, fetch a statically-linked
+# upx release binary for this device architecture and install it to /usr/bin/upx.
+# Returns 1 on any failure so the caller installs the uncompressed binary instead.
+# The downloaded upx persists in overlay, so it is fetched at most once.
+ensure_upx_binary() {
+	command -v upx >/dev/null 2>&1 && return 0
+
+	local upx_arch api_json upx_ver tarball work_dir bin_found
+	local candidates candidate got=0
+	upx_arch="$(upx_arch_for_device)"
+	[ -n "$upx_arch" ] || {
+		log_worker "未识别的架构，跳过自动下载 upx"
+		return 1
+	}
+
+	upx_ver="v4.2.4"
+	api_json="$(mktemp /tmp/upx-rel.XXXXXX)"
+	if fetch_url "https://api.github.com/repos/upx/upx/releases/latest" "$api_json" 30; then
+		local v
+		v="$(grep -o '"tag_name"[^,}]*' "$api_json" 2>/dev/null | head -n1 | \
+			sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')"
+		[ -n "$v" ] && upx_ver="$v"
+	fi
+
+	# Candidate asset URLs in priority order: the exact URL advertised by the
+	# release API first (robust against upstream asset renames), then the
+	# conventional upstream names as fallback (in case the API was blocked).
+	candidates="$(select_upx_asset_url "$api_json" "$upx_arch")"
+	rm -f "$api_json"
+	for candidate in \
+		"https://github.com/upx/upx/releases/download/${upx_ver}/upx-${upx_ver#v}-${upx_arch}_linux.tar.xz" \
+		"https://github.com/upx/upx/releases/download/${upx_ver}/upx-${upx_ver#v}-${upx_arch}.tar.xz"
+	do
+		case "$candidates" in
+			*"$candidate"*) ;;
+			*) candidates="${candidates}
+${candidate}" ;;
+		esac
+	done
+
+	tarball="$(mktemp /tmp/upx-dl.XXXXXX)"
+	for candidate in $candidates; do
+		[ -n "$candidate" ] || continue
+		if fetch_url "$candidate" "$tarball" 180; then
+			got=1
+			break
+		fi
+	done
+	[ "$got" = "1" ] || {
+		rm -f "$tarball"
+		log_worker "自动下载 upx 静态二进制失败 (arch=${upx_arch})，将安装未压缩版本"
+		return 1
+	}
+
+	work_dir="$(mktemp -d /tmp/upx-work.XXXXXX)"
+	if ! extract_archive "$tarball" "$work_dir"; then
+		rm -rf "$work_dir"; rm -f "$tarball"
+		log_worker "解压 upx 失败"
+		return 1
+	fi
+	rm -f "$tarball"
+
+	bin_found="$(find "$work_dir" -type f -name upx 2>/dev/null | head -n1)"
+	if [ -z "$bin_found" ] || ! is_elf_binary "$bin_found"; then
+		rm -rf "$work_dir"
+		log_worker "upx 压缩包内未找到有效的 upx 可执行文件"
+		return 1
+	fi
+	if ! "$bin_found" --version >/dev/null 2>&1; then
+		rm -rf "$work_dir"
+		log_worker "下载的 upx 无法在本机执行 (可能架构不匹配)"
+		return 1
+	fi
+
+	cp -f "$bin_found" /usr/bin/upx >/dev/null 2>&1 || {
+		rm -rf "$work_dir"
+		log_worker "安装 upx 到 /usr/bin 失败"
+		return 1
+	}
+	chmod 755 /usr/bin/upx >/dev/null 2>&1
+	rm -rf "$work_dir"
+	log_worker "已自动下载并安装 upx 静态二进制"
+	log_event "upx_installed" "arch=${upx_arch} version=${upx_ver#v}"
+	command -v upx >/dev/null 2>&1
 }
 
 is_elf_binary() {

@@ -114,11 +114,6 @@ local ctrl_query_url = dsp.build_url("admin", "vpn", "vnt2", "ctrl_query")
 		</table>
 	</fieldset>
 
-	<fieldset class="cbi-section vnt2-card" id="vnt2_events_card" style="display:none;">
-		<h3>下载事件</h3>
-		<pre class="vnt2-pre" id="download_events_text">-</pre>
-	</fieldset>
-
 	<fieldset class="cbi-section vnt2-card">
 		<h3>虚拟网络 <span id="ctrl_state_note" style="font-size:13px; font-weight:400; color:#888;"></span></h3>
 		<table>
@@ -243,10 +238,9 @@ local ctrl_query_url = dsp.build_url("admin", "vpn", "vnt2", "ctrl_query")
 		setHtml("cli_tag", text(data.cli_tag));
 		setHtml("cli_target_tag", text(data.cli_target_tag));
 		setHtml("cli_version_status", versionStatusText(data));
-		setHtml("cli_download", stateText(data.cli_download));
-		renderEvents(data.download_events);
+	setHtml("cli_download", stateText(data.cli_download));
 
-		var errRow = byId("cli_start_error_row");
+	var errRow = byId("cli_start_error_row");
 		if (errRow) {
 			if (!running && data.cli_start_error) {
 				errRow.style.display = "";
@@ -289,25 +283,6 @@ local ctrl_query_url = dsp.build_url("admin", "vpn", "vnt2", "ctrl_query")
 			setHtml("ctrl_public_ipv6", "-");
 		}
 		return running;
-	}
-
-	function renderEvents(events) {
-		var node = byId("download_events_text");
-		var card = byId("vnt2_events_card");
-		if (!node) return;
-		if (!events || !events.length) {
-			node.textContent = "暂无事件";
-			if (card) card.style.display = "none";
-			return;
-		}
-		if (card) card.style.display = "";
-		var lines = [];
-		for (var i = 0; i < events.length; i++) {
-			var ev = events[i];
-			var ts = ev.time ? ev.time + "  " : "";
-			lines.push(ts + ev.name + (ev.detail ? "  " + ev.detail : ""));
-		}
-		node.textContent = lines.join("\n");
 	}
 
 	function fetchCtrlText(what) {

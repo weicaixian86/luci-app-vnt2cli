@@ -861,8 +861,137 @@ ensure_runtime_deps() {
 		log_download "runtime install of wget failed or unavailable"
 	pm_install_pkg unzip >/dev/null 2>&1 || log_download "runtime install of unzip failed or unavailable"
 	[ "$want_upx" = "1" ] && {
-		pm_install_pkg upx >/dev/null 2>&1 || log_download "runtime install of upx failed or unavailable"
+		if command -v upx >/dev/null 2>&1; then
+			: # upx already available on the device
+		elif ensure_upx_binary; then
+			log_download "upx 静态二进制已自动下载并安装"
+		else
+			log_download "upx 不可用，将安装未压缩版本（功能不受影响）"
+		fi
 	}
+}
+
+# Map the detected device architecture to the upx release asset arch token.
+# upx publishes linux-musl static binaries per arch; hard/soft-float ARM both
+# use the single "arm" asset (a static armv5/armv7 little-endian binary).
+upx_arch_for_device() {
+	local a
+	a="$(detect_arch_name)"
+	case "$a" in
+		x86_64)      echo "amd64" ;;
+		aarch64)     echo "arm64" ;;
+		mipsel)      echo "mipsel" ;;
+		mips)        echo "mips" ;;
+		arm-*|armv7*) echo "arm" ;;
+		*)           echo "" ;;
+	esac
+}
+
+# Print the release asset download URL for the given upx arch token from a
+# GitHub release API JSON file. Only linux tarballs are considered (Windows /
+# macOS / source archives are skipped). Prints nothing when nothing matches,
+# so callers can fall back to conventionally-named URLs.
+select_upx_asset_url() {
+	local json="$1" arch="$2"
+	[ -n "$json" ] && [ -f "$json" ] || return 1
+	grep -o '"browser_download_url"[[:space:]]*:[[:space:]]*"[^"]*"' "$json" 2>/dev/null | \
+		sed -E 's/.*"browser_download_url"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' | \
+		grep -E -- "[-._]${arch}([-_]linux)?\.tar\.xz$" | head -n1
+}
+
+# Path B: when the package manager cannot provide `upx` (e.g. iStoreOS/OpenWrt
+# builds whose feed has no upx package), fetch a statically-linked upx release
+# binary for this device architecture and install it to /usr/bin/upx. On any
+# failure we return 1 so the caller's UPX branch (which only runs when
+# `command -v upx` succeeds) simply installs the uncompressed binary instead.
+# The downloaded upx persists in overlay, so it is fetched at most once.
+ensure_upx_binary() {
+	command -v upx >/dev/null 2>&1 && return 0
+
+	local upx_arch json_file api_url upx_ver tarball work_dir bin_found
+	local candidates candidate got=0 m
+	upx_arch="$(upx_arch_for_device)"
+	[ -n "$upx_arch" ] || {
+		log_download "未识别的架构，跳过自动下载 upx"
+		return 1
+	}
+
+	# Resolve the latest upx release tag via the GitHub API (through the mirror
+	# chain). Fall back to a known-good version if the API is unreachable.
+	json_file="$(mktemp /tmp/upx-rel.XXXXXX)"
+	api_url="https://api.github.com/repos/upx/upx/releases/latest"
+	if download_file "$api_url" "$json_file" "api" "gh-proxy" || \
+	   download_file "$api_url" "$json_file" "api" "github"; then
+		upx_ver="$(grep -o '"tag_name"[^,}]*' "$json_file" 2>/dev/null | head -n1 | \
+			sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')"
+	fi
+	[ -n "$upx_ver" ] || upx_ver="v4.2.4"
+
+	# Candidate asset URLs in priority order: the exact URL advertised by the
+	# release API first (robust against upstream asset renames), then the
+	# conventional upstream names as fallback (in case the API was blocked).
+	candidates="$(select_upx_asset_url "$json_file" "$upx_arch")"
+	rm -f "$json_file"
+	for candidate in \
+		"https://github.com/upx/upx/releases/download/${upx_ver}/upx-${upx_ver#v}-${upx_arch}_linux.tar.xz" \
+		"https://github.com/upx/upx/releases/download/${upx_ver}/upx-${upx_ver#v}-${upx_arch}.tar.xz"
+	do
+		case "$candidates" in
+			*"$candidate"*) ;;
+			*) candidates="${candidates}
+${candidate}" ;;
+		esac
+	done
+
+	tarball="$(mktemp /tmp/upx-dl.XXXXXX)"
+	for candidate in $candidates; do
+		[ -n "$candidate" ] || continue
+		for m in gh-proxy github; do
+			if download_file "$candidate" "$tarball" "asset" "$m"; then
+				got=1
+				break
+			fi
+		done
+		[ "$got" = "1" ] && break
+	done
+	[ "$got" = "1" ] || {
+		rm -f "$tarball"
+		log_download "自动下载 upx 静态二进制失败 (arch=${upx_arch})，将安装未压缩版本"
+		return 1
+	}
+
+	work_dir="$(mktemp -d /tmp/upx-work.XXXXXX)"
+	if ! extract_release_asset "$tarball" "$work_dir"; then
+		rm -rf "$work_dir"; rm -f "$tarball"
+		log_download "解压 upx 静态二进制失败"
+		return 1
+	fi
+	rm -f "$tarball"
+
+	bin_found="$(find "$work_dir" -type f -name upx 2>/dev/null | head -n1)"
+	if [ -z "$bin_found" ] || ! is_elf_binary "$bin_found"; then
+		rm -rf "$work_dir"
+		log_download "upx 压缩包内未找到有效的 upx 可执行文件"
+		return 1
+	fi
+	# Verify the binary actually runs on this device (wrong arch would fail at
+	# exec time even though the ELF header looks valid).
+	if ! "$bin_found" --version >/dev/null 2>&1; then
+		rm -rf "$work_dir"
+		log_download "下载的 upx 无法在本机执行 (可能架构不匹配)"
+		return 1
+	fi
+
+	cp -f "$bin_found" /usr/bin/upx >/dev/null 2>&1 || {
+		rm -rf "$work_dir"
+		log_download "安装 upx 到 /usr/bin 失败"
+		return 1
+	}
+	chmod 755 /usr/bin/upx >/dev/null 2>&1
+	rm -rf "$work_dir"
+	log_download "已自动下载并安装 upx 静态二进制 ($(upx --version 2>/dev/null | head -n1))"
+	log_event "upx_installed" "arch=${upx_arch} version=${upx_ver#v}"
+	command -v upx >/dev/null 2>&1
 }
 
 get_downloader() {

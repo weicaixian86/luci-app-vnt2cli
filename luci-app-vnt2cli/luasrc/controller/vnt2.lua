@@ -342,45 +342,6 @@ local function parse_state_file(path)
 	return out
 end
 
--- Parse the structured download/install event log written by the shell scripts.
--- Each line is "<YYYY-MM-DD HH:MM:SS> event=<name> <detail>". We return the
--- most recent `max_lines` events as a list so the status view can show a short,
--- tail-only timeline without ever reading the whole (potentially large) file.
-local function parse_events_file(path, max_lines)
-	max_lines = max_lines or 20
-	local content = fs.readfile(path)
-	if not content or content == "" then
-		return {}
-	end
-
-	local all = {}
-	for line in content:gmatch("[^\r\n]+") do
-		line = trim(line)
-		if line ~= "" then
-			local ts, name, detail = line:match("^(%d%d%d%d%-%d%d%-%d%d %d%d:%d%d:%d%d)%s+event=(%S+)%s*(.*)$")
-			if name then
-				all[#all + 1] = {
-					time = ts,
-					name = textutil.sanitize_text(name),
-					detail = textutil.sanitize_text(trim(detail))
-				}
-			else
-				all[#all + 1] = { time = "", name = "log", detail = textutil.sanitize_text(line) }
-			end
-		end
-	end
-
-	local start = 1
-	if #all > max_lines then
-		start = #all - max_lines + 1
-	end
-	local out = {}
-	for i = start, #all do
-		out[#out + 1] = all[i]
-	end
-	return out
-end
-
 -- vnt2_ctrl emits timestamps in UTC: vnt-ipc's ts_to_string() uses
 -- time::UtcOffset::local_offset_at(), which returns UTC for the short-lived
 -- musl process LuCI spawns (the long-running vnt2_cli daemon, by contrast,
@@ -519,7 +480,6 @@ function act_status()
 
 	e.download_log_size = #(get_log_content(DOWNLOAD_LOG_FILE, LOG_DISPLAY_LINES) or "")
 	e.cli_download = dl
-	e.download_events = parse_events_file(DOWNLOAD_EVENTS_FILE, 20)
 
 	e.ctrl_available = file_exists(get_ctrl_bin())
 	e.ctrl_info = nil
@@ -585,7 +545,8 @@ local function write_runtime_log()
 	plain_write(textutil.merge_log_files({
 		{ path = CLIENT_LOG_FILE, utc = true },
 		{ path = CLI_STDERR_LOG, utc = true },
-		{ path = DOWNLOAD_LOG_FILE, utc = false }
+		{ path = DOWNLOAD_LOG_FILE, utc = false },
+		{ path = DOWNLOAD_EVENTS_FILE, utc = false }
 	}, LOG_DISPLAY_LINES))
 end
 
@@ -636,6 +597,9 @@ function clear_runtime_log()
 	clear_log_file(CLIENT_LOG_FILE)
 	clear_log_file(DOWNLOAD_LOG_FILE)
 	clear_log_file(CLI_STDERR_LOG)
+	-- The download events file is merged into the runtime log, so clearing the
+	-- log must clear it too, otherwise the events would immediately reappear.
+	clear_log_file(DOWNLOAD_EVENTS_FILE)
 	-- Also drop rotated client log files (log4rs fixed window: vnt2.N.log).
 	if fs.access(CLIENT_LOG_DIR) then
 		for name in fs.dir(CLIENT_LOG_DIR) do
