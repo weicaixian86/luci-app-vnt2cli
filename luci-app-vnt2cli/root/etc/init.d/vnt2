@@ -987,6 +987,55 @@ upx_is_usable() {
 	[ -n "$p" ] && binary_health_check "$p"
 }
 
+# Returns 0 iff the file at $1 is a UPX-packed ELF. Prefers `upx -t` (authoritative)
+# when upx is usable; falls back to scanning for the "UPX!" packer signature so a
+# compressed binary is still detected even if upx was later removed from the system.
+is_upx_compressed() {
+	local f="$1"
+	[ -f "$f" ] || return 1
+	if upx_is_usable; then
+		upx -t "$f" >/dev/null 2>&1 && return 0
+	fi
+	# Fallback signature scan (BusyBox grep -a reads binary content).
+	grep -aq 'UPX!' "$f" 2>/dev/null && return 0
+	return 1
+}
+
+# Reconcile the on-disk binary's compression state with the user's setting so that
+# toggling "启用 UPX 压缩" actually takes effect without a manual reinstall:
+#   - compression OFF but a binary is currently UPX-packed  -> delete it so the
+#     download path below re-fetches the UNCOMPRESSED original.
+#   - compression ON  but a binary is uncompressed AND upx is usable -> delete it
+#     so the download path re-fetches and compresses. (Guarded by upx availability
+#     to avoid re-downloading in a loop when upx cannot be obtained on this arch.)
+# Deleting the files simply defeats the "skip-download" gate (which only checks for
+# the binaries' presence); the subsequent download reinstalls them in the desired form.
+reconcile_upx_state() {
+	local want_compress="$1"
+	local cli="${INSTALL_BIN_DIR}/vnt2_cli"
+	local ctrl="${INSTALL_BIN_DIR}/vnt2_ctrl"
+	local cli_c ctrl_c
+	cli_c=0; ctrl_c=0
+	[ -f "$cli" ]  && is_upx_compressed "$cli"  && cli_c=1
+	[ -f "$ctrl" ] && is_upx_compressed "$ctrl" && ctrl_c=1
+
+	if [ "$want_compress" = "1" ]; then
+		if { [ -f "$cli" ]  && [ "$cli_c"  = "0" ]; } || \
+		   { [ -f "$ctrl" ] && [ "$ctrl_c" = "0" ]; }; then
+			# Only re-fetch when we can actually compress; otherwise we would
+			# delete+redownload+stay-uncompressed on every download action.
+			upx_is_usable || return 0
+			log_download "压缩已启用但现有程序未压缩，将重新下载并压缩"
+			rm -f "$cli" "$ctrl" 2>/dev/null
+		fi
+	else
+		if [ "$cli_c" = "1" ] || [ "$ctrl_c" = "1" ]; then
+			log_download "压缩已关闭但现有程序仍为压缩版，将删除并重新下载未压缩程序"
+			rm -f "$cli" "$ctrl" 2>/dev/null
+		fi
+	fi
+}
+
 # Path B (borrowed from luci-app-vnt2 1.7.2's pm_install idiom): make `upx`
 # available on THIS architecture by letting the distribution's package manager
 # install it — `apk add upx` on iStoreOS/Alpine, `opkg install upx` on OpenWrt.
@@ -1846,7 +1895,7 @@ install_binary_to_usrbin() {
 	}
 	# Optional UPX compression to shrink the on-disk binary (helps small-flash
 	# routers). UPX rewrites the file in place; the result stays a valid ELF.
-	upx_compress="${VNT2_UPX_COMPRESS:-1}"
+	upx_compress="${VNT2_UPX_COMPRESS:-0}"
 	if [ "$upx_compress" = "1" ] && upx_is_usable; then
 		if upx -q -q --force "$temp_path" >/dev/null 2>&1; then
 			log_download "UPX compressed ${target_name}"
@@ -1939,7 +1988,7 @@ auto_download_bundle_for_mode() {
 			return 1
 		;;
 	esac
-	config_get_bool VNT2_UPX_COMPRESS "$cfg" "upx_compress" "1"
+	config_get_bool VNT2_UPX_COMPRESS "$cfg" "upx_compress" "0"
 	ensure_runtime_deps "$VNT2_UPX_COMPRESS"
 	download_mirror="$(normalize_download_mirror "$download_mirror")"
 	custom_mirror_url="$(normalize_custom_mirror_url "$custom_mirror_url")"
@@ -1962,6 +2011,11 @@ auto_download_bundle_for_mode() {
 			return 1
 		;;
 	esac
+
+	# Reconcile compression state BEFORE the skip gate: if the user toggled
+	# compression, delete the on-disk binary so the download below re-fetches it
+	# in the desired (compressed/uncompressed) form instead of skipping.
+	reconcile_upx_state "$VNT2_UPX_COMPRESS"
 
 	# Skip-download gate: the upstream asset is an UNCOMPRESSED original, while
 	# the locally installed binary may be UPX-compressed. Their SHA256 can never

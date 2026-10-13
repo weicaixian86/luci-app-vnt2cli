@@ -47,7 +47,7 @@ local text_changed_keys = {}
 -- Bumped whenever the save path changes. Every form save logs it, so a report
 -- can be matched against the code that produced it instead of guessing which
 -- build the device is running.
-local FORM_BUILD = "2026-10-13.5"
+local FORM_BUILD = "2026-10-13.7"
 
 -- Audit trail for config mutations: when a populated list gets cleared the
 -- running log records who did it, so silent losses are diagnosable.
@@ -1021,8 +1021,8 @@ bind_custom_download_mirror(custom_download_mirror, "download_mirror")
 
 local upx_compress = w:taboption("general", Flag, "upx_compress", translate("启用 UPX 压缩"))
 upx_compress.rmempty = false
-upx_compress.default = "1"
-upx_compress.description = translate("下载与手动上传的二进制程序在装入 /usr/bin 前使用 UPX 压缩，显著节省路由器存储空间（部分老旧内核如遇到问题可关闭）")
+upx_compress.default = "0"
+upx_compress.description = translate("下载与手动上传的二进制程序在装入 /usr/bin 前使用 UPX 压缩，显著节省路由器存储空间（默认关闭；部分老旧内核如遇到问题可保持关闭）")
 
 local device_mode = w:taboption("device", ListValue, "device_mode", translate("虚拟网卡模式"))
 device_mode:value("tun", translate("tun（三层网卡）"))

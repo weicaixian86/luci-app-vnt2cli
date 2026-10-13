@@ -387,7 +387,7 @@ pm_install_pkg() {
 get_upx_setting() {
 	local v=""
 	command -v uci >/dev/null 2>&1 && v="$(uci -q get vnt2.@vnt2_cli[0].upx_compress 2>/dev/null || true)"
-	[ "$v" = "0" ] && echo "0" || echo "1"
+	[ "$v" = "1" ] && echo "1" || echo "0"
 }
 
 ensure_runtime_deps_upload() {
