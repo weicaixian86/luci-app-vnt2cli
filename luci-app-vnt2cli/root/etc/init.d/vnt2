@@ -48,6 +48,7 @@ MACHINE_ID_UCI_SEC="machine_id"
 
 DOWNLOAD_CACHE_BASE="/tmp/vnt2-download-cache"
 DOWNLOAD_CLI_STATE="/tmp/vnt2-download-cli.state"
+DOWNLOAD_EVENTS="/tmp/vnt2-download.events"
 VERSION_STATE_FILE="/etc/config/vnt2-cli.version"
 VNT2_FIXED_REPO="vnt-dev/vnt"
 VNT2_FIXED_VERSION="2.0.10"
@@ -387,6 +388,103 @@ file_size() {
 	wc -c <"$path" 2>/dev/null | tr -d '[:space:]'
 }
 
+# Human-readable byte size for logs (e.g. 12.4MB).
+format_size() {
+	local b="$1" mb
+	case "$b" in
+		''|*[!0-9]*) echo "0B"; return ;;
+	esac
+	[ "$b" -lt 1024 ] 2>/dev/null && { echo "${b}B"; return; }
+	[ "$b" -lt 1048576 ] 2>/dev/null && { echo "$((b / 1024))KB"; return; }
+	mb="$(awk "BEGIN{printf \"%.1f\", $b / 1048576}")"
+	[ "$b" -lt 1073741824 ] 2>/dev/null && { echo "${mb}MB"; return; }
+	echo "$(awk "BEGIN{printf \"%.2f\", $b / 1073741824}")GB"
+}
+
+# Returns 0 when the filesystem holding `path` has at least `need_kb` KiB free.
+check_free_space() {
+	local path="$1" need_kb="$2" avail
+	[ -d "$path" ] || path="$(dirname "$path" 2>/dev/null)"
+	[ -n "$path" ] || return 0
+	avail="$(df -k "$path" 2>/dev/null | awk 'NR==2{print $4}')"
+	[ -z "$avail" ] && return 0
+	[ "$avail" -ge "$need_kb" ] 2>/dev/null
+}
+
+# Detect the real container type from the leading magic bytes rather than the
+# file name, so a misnamed or hand-edited archive is never unpacked with the
+# wrong tool. Returns: elf | gz | zip | xz | unknown.
+detect_file_magic() {
+	local f="$1" magic
+	[ -s "$f" ] || { echo "unknown"; return; }
+	magic="$(dd if="$f" bs=1 count=4 2>/dev/null | od -An -tx1 | tr -dc '0-9a-fA-F')"
+	case "$magic" in
+		7f454c46*) echo "elf" ;;
+		1f8b*)     echo "gz" ;;
+		504b0304*) echo "zip" ;;
+		fd377a585a*) echo "xz" ;;
+		*)         echo "unknown" ;;
+	esac
+}
+
+# Normalize an asset to a dispatch key: magic bytes win, file extension is the
+# fallback. gzip here always means a tar.gz bundle in our context.
+classify_archive() {
+	local f="$1" magic ext
+	magic="$(detect_file_magic "$f")"
+	case "$magic" in
+		elf) echo "elf"; return ;;
+		gz)  echo "tar.gz"; return ;;
+		xz)  echo "tar.xz"; return ;;
+		zip) echo "zip"; return ;;
+	esac
+	ext="$(printf '%s' "$f" | tr 'A-Z' 'a-z')"
+	case "$ext" in
+		*.zip)        echo "zip" ;;
+		*.tgz|*.tar.gz) echo "tar.gz" ;;
+		*.tar.xz|*.txz) echo "tar.xz" ;;
+		*) echo "unknown" ;;
+	esac
+}
+
+# Post-install sanity check: actually execute the binary and confirm it runs.
+# Catches the "downloaded the right file but wrong architecture" case, where
+# is_elf_binary() passes (valid ELF magic) yet the kernel rejects it at exec
+# time with "Exec format error".
+binary_health_check() {
+	local p="$1" rc
+	[ -x "$p" ] || return 1
+	"$p" --version >/dev/null 2>&1
+	rc=$?
+	[ "$rc" -eq 0 ]
+}
+
+# Parse the running binary's self-reported version (e.g. "vnt2-cli 2.0.10").
+get_installed_version() {
+	local p="$1" out v
+	[ -x "$p" ] || return 1
+	out="$("$p" --version 2>/dev/null)"
+	[ -n "$out" ] || return 1
+	v="$(printf '%s' "$out" | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+([-+._][A-Za-z0-9]+)*' | head -n1)"
+	[ -n "$v" ] && { echo "$v"; return 0; }
+	return 1
+}
+
+# Append a structured, machine-readable event for the UI status view.
+log_event() {
+	local name="$1" detail="$2"
+	printf '%s event=%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" \
+		"$(normalize_log_text "$name")" "$(normalize_log_text "$detail")" >>"${DOWNLOAD_EVENTS}"
+	# Cap the event log at the most recent 200 lines so it cannot grow without
+	# bound in tmpfs.
+	local n
+	n="$(wc -l <"${DOWNLOAD_EVENTS}" 2>/dev/null | tr -d '[:space:]')"
+	[ "${n:-0}" -gt 200 ] 2>/dev/null && {
+		tail -n 200 "${DOWNLOAD_EVENTS}" >"${DOWNLOAD_EVENTS}.tmp" 2>/dev/null \
+			&& mv -f "${DOWNLOAD_EVENTS}.tmp" "${DOWNLOAD_EVENTS}"
+	}
+}
+
 write_version_state() {
 	local tag="$1"
 	local source="$2"
@@ -397,14 +495,19 @@ write_version_state() {
 	local dir tmp cli_mtime cli_size ctrl_mtime ctrl_size
 
 	[ -n "$cli_path" ] && [ -f "$cli_path" ] || return 1
-	[ -n "$ctrl_path" ] && [ -f "$ctrl_path" ] || return 1
 	dir="${VERSION_STATE_FILE%/*}"
 	mkdir -p "$dir" >/dev/null 2>&1 || return 1
 	tmp="${VERSION_STATE_FILE}.$$"
 	cli_mtime="$(file_mtime "$cli_path")"
 	cli_size="$(file_size "$cli_path")" || return 1
-	ctrl_mtime="$(file_mtime "$ctrl_path")"
-	ctrl_size="$(file_size "$ctrl_path")" || return 1
+	if [ -n "$ctrl_path" ] && [ -f "$ctrl_path" ]; then
+		ctrl_mtime="$(file_mtime "$ctrl_path")"
+		ctrl_size="$(file_size "$ctrl_path")" || return 1
+	else
+		ctrl_path=""
+		ctrl_mtime="0"
+		ctrl_size="0"
+	fi
 
 	if ! (
 		umask 077
@@ -851,9 +954,9 @@ download_file() {
 					if [ "$total_bytes" -gt 0 ] 2>/dev/null; then
 						pct=$(( cur * 100 / total_bytes ))
 						[ "$pct" -gt 100 ] && pct=100
-						log_download "下载进度 ${pct}% (${cur}/${total_bytes} 字节) 镜像=${actual_url}"
+						log_download "下载进度 ${pct}% ($(format_size "$cur")/$(format_size "$total_bytes")) 镜像=${actual_url}"
 					else
-						log_download "下载进度 ${cur} 字节 镜像=${actual_url}"
+						log_download "下载进度 $(format_size "$cur") 镜像=${actual_url}"
 					fi
 				done
 			) &
@@ -862,7 +965,7 @@ download_file() {
 
 		case "$downloader" in
 			curl)
-				curl -fsSL --connect-timeout "$connect_timeout" --max-time "$transfer_timeout" --retry 0 \
+				curl -fsSL --connect-timeout "$connect_timeout" --max-time "$transfer_timeout" --retry 2 --retry-delay 5 \
 					-A "luci-app-vnt2cli" \
 					-H "Accept: application/vnd.github+json, application/octet-stream, */*" \
 					-o "$out" "$actual_url" >/dev/null 2>&1
@@ -870,12 +973,12 @@ download_file() {
 			;;
 			wget)
 				if [ -n "$timeout_cmd" ]; then
-					"$timeout_cmd" "$transfer_timeout" wget -q --timeout="$transfer_timeout" --tries=1 \
+					"$timeout_cmd" "$transfer_timeout" wget -q --timeout="$transfer_timeout" --tries=2 \
 						--header="User-Agent: luci-app-vnt2cli" \
 						--header="Accept: application/vnd.github+json, application/octet-stream, */*" \
 						-O "$out" "$actual_url" >/dev/null 2>&1
 				else
-					wget -q --timeout="$transfer_timeout" --tries=1 \
+					wget -q --timeout="$transfer_timeout" --tries=2 \
 						--header="User-Agent: luci-app-vnt2cli" \
 						--header="Accept: application/vnd.github+json, application/octet-stream, */*" \
 						-O "$out" "$actual_url" >/dev/null 2>&1
@@ -1418,10 +1521,11 @@ END { exit bad }
 
 archive_is_safe() {
 	local asset_file="$1"
-	local entries details
+	local entries details kind
 
-	case "$asset_file" in
-		*.tar.gz|*.tgz)
+	kind="$(classify_archive "$asset_file")"
+	case "$kind" in
+		tar.gz)
 			entries="$(tar -tzf "$asset_file" 2>/dev/null)" || return 1
 			printf '%s\n' "$entries" | archive_paths_are_safe || return 1
 			details="$(tar -tvzf "$asset_file" 2>/dev/null)" || return 1
@@ -1430,7 +1534,7 @@ archive_is_safe() {
 				END { exit bad }
 			' || return 1
 		;;
-		*.tar.xz)
+		tar.xz)
 			entries="$(tar -tJf "$asset_file" 2>/dev/null)" || return 1
 			printf '%s\n' "$entries" | archive_paths_are_safe || return 1
 			details="$(tar -tvJf "$asset_file" 2>/dev/null)" || return 1
@@ -1439,7 +1543,7 @@ archive_is_safe() {
 				END { exit bad }
 			' || return 1
 		;;
-		*.zip)
+		zip)
 			if command -v unzip >/dev/null 2>&1; then
 				entries="$(unzip -Z1 "$asset_file" 2>/dev/null)" || return 1
 				printf '%s\n' "$entries" | archive_paths_are_safe || return 1
@@ -1461,6 +1565,10 @@ archive_is_safe() {
 				return 1
 			fi
 		;;
+		*)
+			# Unknown container type; refuse to extract rather than trust a bare file.
+			return 1
+		;;
 	esac
 
 	return 0
@@ -1471,8 +1579,8 @@ validate_asset_file() {
 
 	[ -s "$asset_file" ] || return 1
 
-	case "$asset_file" in
-		*.zip)
+	case "$(classify_archive "$asset_file")" in
+		zip)
 			if command -v unzip >/dev/null 2>&1; then
 				unzip -t "$asset_file" >/dev/null 2>&1 && return 0
 			fi
@@ -1484,11 +1592,11 @@ validate_asset_file() {
 			fi
 			return 1
 		;;
-		*.tar.gz|*.tgz)
+		tar.gz)
 			tar -tzf "$asset_file" >/dev/null 2>&1
 			return $?
 		;;
-		*.tar.xz)
+		tar.xz)
 			tar -tJf "$asset_file" >/dev/null 2>&1
 			return $?
 		;;
@@ -1515,17 +1623,17 @@ extract_release_asset() {
 	rm -rf "$dest_dir"
 	mkdir -p "$dest_dir"
 
-	case "$asset_file" in
-		*.tar.gz|*.tgz)
+	case "$(classify_archive "$asset_file")" in
+		tar.gz)
 			tar -xzf "$asset_file" -C "$dest_dir" >/dev/null 2>&1 || return 1
 		;;
-		*.tar.xz)
+		tar.xz)
 			tar -xJf "$asset_file" -C "$dest_dir" >/dev/null 2>&1 || return 1
 		;;
-		*.zip)
+		zip)
 			extract_zip_asset "$asset_file" "$dest_dir" || return 1
 		;;
-		*)
+		elf|*)
 			base="$(basename "$asset_file")"
 			cp -f "$asset_file" "${dest_dir}/${base}" >/dev/null 2>&1 || return 1
 		;;
@@ -1623,6 +1731,7 @@ install_binary_to_usrbin() {
 install_bundle_to_usrbin() {
 	local extracted_dir="$1"
 	local cli_bin ctrl_bin
+	local cli_installed ctrl_installed
 
 	cli_bin="$(locate_extracted_bin "$extracted_dir" "vnt2_cli")" || return 1
 	ensure_elf_exec "$cli_bin" || return 1
@@ -1631,6 +1740,20 @@ install_bundle_to_usrbin() {
 	ctrl_bin="$(locate_extracted_bin "$extracted_dir" "vnt2_ctrl")" || return 1
 	ensure_elf_exec "$ctrl_bin" || return 1
 	install_binary_to_usrbin "$ctrl_bin" "vnt2_ctrl" >/dev/null || return 1
+
+	# B. Post-install health check: actually run the binaries. is_elf_binary only
+	# proves a valid ELF header; a binary built for the wrong endian/float ABI
+	# still has a valid header yet fails at exec time. A failed health check
+	# means the downloaded asset does not run on this device.
+	cli_installed="${INSTALL_BIN_DIR}/vnt2_cli"
+	ctrl_installed="${INSTALL_BIN_DIR}/vnt2_ctrl"
+	if ! binary_health_check "$cli_installed"; then
+		log_download "安装后健康检查失败: ${cli_installed} 无法在本机执行 (可能架构不匹配)"
+		return 1
+	fi
+	if ! binary_health_check "$ctrl_installed"; then
+		log_download "安装后健康检查警告: ${ctrl_installed} 无法在本机执行 (控制工具可能架构不匹配)"
+	fi
 
 	return 0
 }
@@ -1678,6 +1801,13 @@ auto_download_bundle_for_mode() {
 	custom_mirror_url="$(normalize_custom_mirror_url "$custom_mirror_url")"
 	cache_mirror_key="$(get_download_mirror_cache_key "$download_repo" "$download_mirror" "$custom_mirror_url")"
 
+	# I. Clear stale download cache before a fresh attempt so /tmp does not
+	# accumulate old bundles across versions and mirror retries. Recent caches
+	# (used by the reuse path) are kept; only >7-day-old dirs and partial files
+	# are pruned.
+	find "$DOWNLOAD_CACHE_BASE" -mindepth 1 -mtime +7 -exec rm -rf {} + 2>/dev/null
+	rm -f "${DOWNLOAD_CACHE_BASE}"/*.part "${DOWNLOAD_CACHE_BASE}"/*.tmp 2>/dev/null
+
 	arch_name="$(detect_arch_name)"
 	case "$arch_name" in
 		x86_64|aarch64|armv7-musleabihf|armv7-musleabi|arm-musleabihf|arm-musleabi|mips|mipsel)
@@ -1707,6 +1837,40 @@ auto_download_bundle_for_mode() {
 		uci -q set "${CONF}.${cfg}.vnt2_ctrl_bin=${INSTALL_BIN_DIR}/vnt2_ctrl"
 		uci commit "$CONF" >/dev/null 2>&1
 		return 0
+	fi
+
+	# A. Disk space precheck (helps 4MB-flash devices such as AR9331). Compute
+	# the expected asset size once from the canonical URL; sizes are identical
+	# across mirrors. Require enough room in /tmp for archive+extraction, and in
+	# /usr/bin for the installed binaries. If the size is unknown we skip the
+	# check and let the download fail naturally rather than risk a false reject.
+	precheck_asset_url="$(get_release_asset_url "$download_repo" "$scope" "$download_tag" "$arch_name" 2>/dev/null)"
+	if [ -n "$precheck_asset_url" ]; then
+		precheck_len="$(fetch_content_length "$precheck_asset_url" "$(get_downloader asset 2>/dev/null || echo curl)")"
+		precheck_len_kb=$(( ${precheck_len:-0} / 1024 ))
+		if [ "$precheck_len_kb" -gt 0 ]; then
+			# The downloaded asset is the UNCOMPRESSED original; the binaries are
+			# UPX-compressed on install, so they end up SMALLER than the asset.
+			# Need: /tmp for archive + extraction (~2x), /usr/bin for the two
+			# installed binaries (<= asset size, plus a small margin). No large
+			# fixed floor, otherwise 4MB-flash devices would be rejected outright.
+			need_dl_kb=$(( precheck_len_kb * 2 + 1024 ))
+			need_install_kb=$(( precheck_len_kb + 2048 ))
+			if ! check_free_space "${DOWNLOAD_CACHE_BASE}" "$need_dl_kb"; then
+				log_download "下载目录空间不足(需约 $(format_size $((need_dl_kb * 1024))) 可用)，跳过下载"
+				write_download_state "$state_file" "failed" "下载目录空间不足，无法下载" "" "$download_tag" "$arch_name" ""
+				log_event "insufficient_space" "download_dir need=$(format_size $((need_dl_kb * 1024)))"
+				return 1
+			fi
+			if ! check_free_space "${INSTALL_BIN_DIR}" "$need_install_kb"; then
+				log_download "安装目录空间不足(需约 $(format_size $((need_install_kb * 1024))) 可用)，跳过下载"
+				write_download_state "$state_file" "failed" "安装目录空间不足，无法安装" "" "$download_tag" "$arch_name" ""
+				log_event "insufficient_space" "install_dir need=$(format_size $((need_install_kb * 1024)))"
+				return 1
+			fi
+		else
+			log_download "无法获取资源大小，跳过空间预检(交由下载过程自然反馈)"
+		fi
 	fi
 
 	query_dir="${DOWNLOAD_CACHE_BASE}/query_$(sanitize_name "${cache_mirror_key}_${download_repo}_${download_tag}_${arch_name}_${scope}")"
@@ -1754,6 +1918,7 @@ EOF
 
 			asset_url="$(select_release_asset "$json_file" "$scope" "$release_tag" "$arch_name")" || {
 				log_download "no release asset matched arch=${arch_name} scope=${scope} mirror=${candidate_mirror}"
+				log_event "no_matching_asset" "arch=${arch_name} scope=${scope} mirror=${candidate_mirror}"
 				continue
 			}
 
@@ -1810,6 +1975,7 @@ EOF
 					break
 				fi
 				log_download "asset download ok tool=${DOWNLOAD_LAST_TOOL:-unknown} used_url=${DOWNLOAD_LAST_URL:-unknown} mirror=${candidate_mirror} file=${asset_file}"
+				log_event "download_complete" "mirror=${candidate_mirror} size=$(format_size $(file_size "$asset_file" 2>/dev/null || echo 0))"
 			fi
 
 			if [ -n "$expected_sha" ]; then
@@ -1873,6 +2039,7 @@ EOF
 			uci -q set "${CONF}.${cfg}.vnt2_ctrl_bin=${INSTALL_BIN_DIR}/vnt2_ctrl"
 			uci commit "$CONF" >/dev/null 2>&1
 			log_download "bundle installed: cli=${INSTALL_BIN_DIR}/vnt2_cli ctrl=${INSTALL_BIN_DIR}/vnt2_ctrl mirror=${candidate_mirror} url=${asset_url}"
+			log_event "install_success" "cli=${INSTALL_BIN_DIR}/vnt2_cli ctrl=${INSTALL_BIN_DIR}/vnt2_ctrl mirror=${candidate_mirror}"
 			write_download_state "$state_file" "success" "installed vnt2_cli and vnt2_ctrl to /usr/bin" "$asset_name" "$release_tag" "$arch_name" "${INSTALL_BIN_DIR}/vnt2_cli"
 			write_version_state "$release_tag" "download" "$arch_name" "$asset_name" "${INSTALL_BIN_DIR}/vnt2_cli" "${INSTALL_BIN_DIR}/vnt2_ctrl" || \
 				log_download "failed to persist version state tag=${release_tag}"
@@ -1882,6 +2049,7 @@ EOF
 
 	write_download_state "$state_file" "failed" "all download mirrors failed" "${asset_name:-unknown}" "$download_tag" "$arch_name" ""
 	log_download "all download mirrors failed repo=${download_repo} tag=${download_tag} strategy=${download_mirror} arch=${arch_name} scope=${scope}"
+	log_event "all_mirrors_failed" "repo=${download_repo} tag=${download_tag} arch=${arch_name}"
 	return 1
 }
 

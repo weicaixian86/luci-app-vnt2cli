@@ -15,6 +15,7 @@ local DOWNLOAD_LOG_FILE = "/tmp/vnt2-download.log"
 local DOWNLOAD_STATE_FILE = "/tmp/vnt2-download-cli.state"
 local RESTART_PENDING_FILE = "/tmp/vnt2-restart.pending"
 local RUNTIME_TOML_FILE = "/tmp/vnt2cli.toml"
+local DOWNLOAD_EVENTS_FILE = "/tmp/vnt2-download.events"
 
 function index()
 	if not fs.access("/etc/config/vnt2") then
@@ -341,6 +342,45 @@ local function parse_state_file(path)
 	return out
 end
 
+-- Parse the structured download/install event log written by the shell scripts.
+-- Each line is "<YYYY-MM-DD HH:MM:SS> event=<name> <detail>". We return the
+-- most recent `max_lines` events as a list so the status view can show a short,
+-- tail-only timeline without ever reading the whole (potentially large) file.
+local function parse_events_file(path, max_lines)
+	max_lines = max_lines or 20
+	local content = fs.readfile(path)
+	if not content or content == "" then
+		return {}
+	end
+
+	local all = {}
+	for line in content:gmatch("[^\r\n]+") do
+		line = trim(line)
+		if line ~= "" then
+			local ts, name, detail = line:match("^(%d%d%d%d%-%d%d%-%d%d %d%d:%d%d:%d%d)%s+event=(%S+)%s*(.*)$")
+			if name then
+				all[#all + 1] = {
+					time = ts,
+					name = textutil.sanitize_text(name),
+					detail = textutil.sanitize_text(trim(detail))
+				}
+			else
+				all[#all + 1] = { time = "", name = "log", detail = textutil.sanitize_text(line) }
+			end
+		end
+	end
+
+	local start = 1
+	if #all > max_lines then
+		start = #all - max_lines + 1
+	end
+	local out = {}
+	for i = start, #all do
+		out[#out + 1] = all[i]
+	end
+	return out
+end
+
 -- vnt2_ctrl emits timestamps in UTC: vnt-ipc's ts_to_string() uses
 -- time::UtcOffset::local_offset_at(), which returns UTC for the short-lived
 -- musl process LuCI spawns (the long-running vnt2_cli daemon, by contrast,
@@ -464,10 +504,22 @@ function act_status()
 	-- blocked binary must not delay LuCI while an apply-triggered restart runs.
 	e.cli_tag = get_local_tag(get_cli_bin())
 	e.cli_target_tag = FIXED_VNT2_VERSION
+	-- F: installed-vs-target version compare, derived for the status view.
+	if e.cli_tag == "" then
+		e.cli_version_status = "unknown"
+		e.cli_version_match = false
+	elseif e.cli_tag == FIXED_VNT2_VERSION then
+		e.cli_version_status = "latest"
+		e.cli_version_match = true
+	else
+		e.cli_version_status = "outdated"
+		e.cli_version_match = false
+	end
 	e.log_level = uci_first("vnt2_cli", "log_level", "info")
 
 	e.download_log_size = #(get_log_content(DOWNLOAD_LOG_FILE, LOG_DISPLAY_LINES) or "")
 	e.cli_download = dl
+	e.download_events = parse_events_file(DOWNLOAD_EVENTS_FILE, 20)
 
 	e.ctrl_available = file_exists(get_ctrl_bin())
 	e.ctrl_info = nil

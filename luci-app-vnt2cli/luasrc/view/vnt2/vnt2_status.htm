@@ -108,9 +108,15 @@ local ctrl_query_url = dsp.build_url("admin", "vpn", "vnt2", "ctrl_query")
 			<tr><td>日志级别</td><td id="cli_log_level">-</td></tr>
 			<tr><td>本地版本</td><td id="cli_tag">-</td></tr>
 			<tr><td>目标版本</td><td id="cli_target_tag">-</td></tr>
+			<tr><td>版本比对</td><td id="cli_version_status">-</td></tr>
 			<tr><td>下载状态</td><td id="cli_download">-</td></tr>
 			<tr id="cli_start_error_row" style="display:none;"><td>最近启动错误</td><td id="cli_start_error">-</td></tr>
 		</table>
+	</fieldset>
+
+	<fieldset class="cbi-section vnt2-card" id="vnt2_events_card" style="display:none;">
+		<h3>下载事件</h3>
+		<pre class="vnt2-pre" id="download_events_text">-</pre>
 	</fieldset>
 
 	<fieldset class="cbi-section vnt2-card">
@@ -198,6 +204,19 @@ local ctrl_query_url = dsp.build_url("admin", "vpn", "vnt2", "ctrl_query")
 		return out;
 	}
 
+	// F: installed-vs-target version compare label.
+	function versionStatusText(data) {
+		var tag = data.cli_tag || "";
+		var target = data.cli_target_tag || "";
+		if (tag === "") {
+			return "未知（手动上传或非插件安装）";
+		}
+		if (tag === target) {
+			return "已是最新 " + escapeHtml(tag);
+		}
+		return "低于目标：本地 " + escapeHtml(tag) + " / 目标 " + escapeHtml(target);
+	}
+
 	function checked(id) {
 		var node = byId(id);
 		return node && node.checked;
@@ -223,7 +242,9 @@ local ctrl_query_url = dsp.build_url("admin", "vpn", "vnt2", "ctrl_query")
 		setHtml("cli_log_level", text(data.log_level));
 		setHtml("cli_tag", text(data.cli_tag));
 		setHtml("cli_target_tag", text(data.cli_target_tag));
+		setHtml("cli_version_status", versionStatusText(data));
 		setHtml("cli_download", stateText(data.cli_download));
+		renderEvents(data.download_events);
 
 		var errRow = byId("cli_start_error_row");
 		if (errRow) {
@@ -268,6 +289,25 @@ local ctrl_query_url = dsp.build_url("admin", "vpn", "vnt2", "ctrl_query")
 			setHtml("ctrl_public_ipv6", "-");
 		}
 		return running;
+	}
+
+	function renderEvents(events) {
+		var node = byId("download_events_text");
+		var card = byId("vnt2_events_card");
+		if (!node) return;
+		if (!events || !events.length) {
+			node.textContent = "暂无事件";
+			if (card) card.style.display = "none";
+			return;
+		}
+		if (card) card.style.display = "";
+		var lines = [];
+		for (var i = 0; i < events.length; i++) {
+			var ev = events[i];
+			var ts = ev.time ? ev.time + "  " : "";
+			lines.push(ts + ev.name + (ev.detail ? "  " + ev.detail : ""));
+		}
+		node.textContent = lines.join("\n");
 	}
 
 	function fetchCtrlText(what) {

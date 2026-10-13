@@ -4,7 +4,9 @@ PENDING_FILE="${VNT2_UPLOAD_PENDING_FILE:-/etc/vnt2/upload.pending}"
 CLAIMED_FILE="${VNT2_UPLOAD_CLAIMED_FILE:-/etc/vnt2/upload.claimed}"
 UPLOAD_DIR="${VNT2_UPLOAD_DIR:-/etc/vnt2/upload}"
 DOWNLOAD_LOG="${VNT2_UPLOAD_LOG_FILE:-/tmp/vnt2-download.log}"
+VNT2_FIXED_VERSION="${VNT2_FIXED_VERSION:-2.0.10}"
 DOWNLOAD_STATE="${VNT2_UPLOAD_STATE_FILE:-/tmp/vnt2-download-cli.state}"
+DOWNLOAD_EVENTS="${VNT2_UPLOAD_EVENTS:-/tmp/vnt2-download.events}"
 VERSION_STATE_FILE="${VNT2_VERSION_STATE_FILE:-/etc/config/vnt2-cli.version}"
 RESTART_PENDING_FILE="${VNT2_RESTART_PENDING_FILE:-/tmp/vnt2-restart.pending}"
 INSTALL_BIN_DIR="${VNT2_INSTALL_BIN_DIR:-/usr/bin}"
@@ -60,6 +62,134 @@ EOF
 
 clear_version_state() {
 	rm -f "$VERSION_STATE_FILE" "$VERSION_STATE_FILE".* >/dev/null 2>&1
+}
+
+write_version_state() {
+	local tag="$1" source="$2" arch="$3" asset="$4" cli_path="$5" ctrl_path="$6"
+	local dir tmp cli_size ctrl_size
+
+	[ -n "$cli_path" ] && [ -f "$cli_path" ] || return 1
+	dir="${VERSION_STATE_FILE%/*}"
+	mkdir -p "$dir" >/dev/null 2>&1 || return 1
+	tmp="${VERSION_STATE_FILE}.$$"
+	cli_size="$(wc -c <"$cli_path" 2>/dev/null | tr -d '[:space:]')"
+	if [ -n "$ctrl_path" ] && [ -f "$ctrl_path" ]; then
+		ctrl_size="$(wc -c <"$ctrl_path" 2>/dev/null | tr -d '[:space:]')"
+		ctrl_mtime="$(date +%s)"
+	else
+		ctrl_path=""
+		ctrl_size="0"
+		ctrl_mtime="0"
+	fi
+	(
+		umask 077
+		cat >"$tmp" <<EOF
+tag=$(normalize_text "$tag")
+source=$(normalize_text "$source")
+arch=$(normalize_text "$arch")
+asset=$(normalize_text "$asset")
+cli_path=$(normalize_text "$cli_path")
+cli_mtime=$(date +%s)
+cli_size=${cli_size}
+ctrl_path=$(normalize_text "$ctrl_path")
+ctrl_mtime=${ctrl_mtime}
+ctrl_size=${ctrl_size}
+time=$(date '+%Y-%m-%d %H:%M:%S')
+EOF
+	) || { rm -f "$tmp"; return 1; }
+	mv -f "$tmp" "$VERSION_STATE_FILE" >/dev/null 2>&1 || { rm -f "$tmp"; return 1; }
+	return 0
+}
+
+# Human-readable byte size for logs (e.g. 12.4MB).
+format_size() {
+	local b="$1" mb
+	case "$b" in
+		''|*[!0-9]*) echo "0B"; return ;;
+	esac
+	[ "$b" -lt 1024 ] 2>/dev/null && { echo "${b}B"; return; }
+	[ "$b" -lt 1048576 ] 2>/dev/null && { echo "$((b / 1024))KB"; return; }
+	mb="$(awk "BEGIN{printf \"%.1f\", $b / 1048576}")"
+	[ "$b" -lt 1073741824 ] 2>/dev/null && { echo "${mb}MB"; return; }
+	echo "$(awk "BEGIN{printf \"%.2f\", $b / 1073741824}")GB"
+}
+
+# Returns 0 when the filesystem holding `path` has at least `need_kb` KiB free.
+check_free_space() {
+	local path="$1" need_kb="$2" avail
+	[ -d "$path" ] || path="$(dirname "$path" 2>/dev/null)"
+	[ -n "$path" ] || return 0
+	avail="$(df -k "$path" 2>/dev/null | awk 'NR==2{print $4}')"
+	[ -z "$avail" ] && return 0
+	[ "$avail" -ge "$need_kb" ] 2>/dev/null
+}
+
+# Detect the real container type from leading magic bytes, not the file name.
+detect_file_magic() {
+	local f="$1" magic
+	[ -s "$f" ] || { echo "unknown"; return; }
+	magic="$(dd if="$f" bs=1 count=4 2>/dev/null | od -An -tx1 | tr -dc '0-9a-fA-F')"
+	case "$magic" in
+		7f454c46*) echo "elf" ;;
+		1f8b*)     echo "gz" ;;
+		504b0304*) echo "zip" ;;
+		fd377a585a*) echo "xz" ;;
+		*)         echo "unknown" ;;
+	esac
+}
+
+classify_archive() {
+	local f="$1" magic ext
+	magic="$(detect_file_magic "$f")"
+	case "$magic" in
+		elf) echo "elf"; return ;;
+		gz)  echo "tar.gz"; return ;;
+		xz)  echo "tar.xz"; return ;;
+		zip) echo "zip"; return ;;
+	esac
+	ext="$(printf '%s' "$f" | tr 'A-Z' 'a-z')"
+	case "$ext" in
+		*.zip)         echo "zip" ;;
+		*.tgz|*.tar.gz) echo "tar.gz" ;;
+		*.tar.xz|*.txz) echo "tar.xz" ;;
+		*) echo "unknown" ;;
+	esac
+}
+
+# Post-install sanity check: actually execute the binary and confirm it runs,
+# catching the "valid ELF header but wrong architecture" case.
+binary_health_check() {
+	local p="$1" rc
+	[ -x "$p" ] || return 1
+	"$p" --version >/dev/null 2>&1
+	rc=$?
+	[ "$rc" -eq 0 ]
+}
+
+# Parse the running binary's self-reported version (e.g. "vnt2-cli 2.0.10").
+get_installed_version() {
+	local p="$1" out v
+	[ -x "$p" ] || return 1
+	out="$("$p" --version 2>/dev/null)"
+	[ -n "$out" ] || return 1
+	v="$(printf '%s' "$out" | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+([-+._][A-Za-z0-9]+)*' | head -n1)"
+	[ -n "$v" ] && { echo "$v"; return 0; }
+	return 1
+}
+
+# Append a structured, machine-readable event for the UI status view.
+log_event() {
+	local name="$1" detail="$2"
+	printf '%s event=%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" \
+		"$(normalize_text "$name")" "$(normalize_text "$detail")" >>"${DOWNLOAD_EVENTS}"
+	# Cap the event log at the most recent 200 lines so it cannot grow without
+	# bound in tmpfs.
+	local n
+	n="$(wc -l <"${DOWNLOAD_EVENTS}" 2>/dev/null | tr -d '[:space:]')"
+	[ "${n:-0}" -gt 200 ] 2>/dev/null && {
+		tail -n 200 "${DOWNLOAD_EVENTS}" >"${DOWNLOAD_EVENTS}.tmp" 2>/dev/null \
+			&& mv -f "${DOWNLOAD_EVENTS}.tmp" "${DOWNLOAD_EVENTS}"
+	}
 }
 
 # Decide between big-endian mips and little-endian mipsel by reading the ELF
@@ -250,7 +380,10 @@ END { exit bad }
 
 zip_archive_is_safe() {
 	local archive="$1"
-	local entries details
+	local entries details kind
+
+	kind="$(classify_archive "$archive")"
+	[ "$kind" = "zip" ] || return 1
 
 	if command -v unzip >/dev/null 2>&1; then
 		entries="$(unzip -Z1 "$archive" 2>/dev/null)" || return 1
@@ -278,11 +411,24 @@ zip_archive_is_safe() {
 
 tar_archive_is_safe() {
 	local archive="$1"
-	local entries details
+	local entries details kind
 
-	entries="$(tar -tzf "$archive" 2>/dev/null)" || return 1
-	printf '%s\n' "$entries" | archive_paths_are_safe || return 1
-	details="$(tar -tvzf "$archive" 2>/dev/null)" || return 1
+	kind="$(classify_archive "$archive")"
+	case "$kind" in
+		tar.gz)
+			entries="$(tar -tzf "$archive" 2>/dev/null)" || return 1
+			printf '%s\n' "$entries" | archive_paths_are_safe || return 1
+			details="$(tar -tvzf "$archive" 2>/dev/null)" || return 1
+		;;
+		tar.xz)
+			entries="$(tar -tJf "$archive" 2>/dev/null)" || return 1
+			printf '%s\n' "$entries" | archive_paths_are_safe || return 1
+			details="$(tar -tvJf "$archive" 2>/dev/null)" || return 1
+		;;
+		*)
+			return 1
+		;;
+	esac
 	printf '%s\n' "$details" | awk '
 		{ type = substr($0, 1, 1); if (type != "-" && type != "d") bad = 1 }
 		END { exit bad }
@@ -320,9 +466,11 @@ locate_extracted_bin() {
 extract_archive() {
 	local archive="$1"
 	local dest_dir="$2"
+	local kind
 
-	case "$(printf '%s' "$archive" | tr 'A-Z' 'a-z')" in
-		*.zip)
+	kind="$(classify_archive "$archive")"
+	case "$kind" in
+		zip)
 			if command -v unzip >/dev/null 2>&1; then
 				unzip -qo "$archive" -d "$dest_dir" >/dev/null 2>&1 && return 0
 			fi
@@ -334,8 +482,16 @@ extract_archive() {
 			fi
 			return 1
 		;;
-		*)
+		tar.gz)
 			tar -xzf "$archive" -C "$dest_dir" >/dev/null 2>&1
+			return $?
+		;;
+		tar.xz)
+			tar -xJf "$archive" -C "$dest_dir" >/dev/null 2>&1
+			return $?
+		;;
+		elf|*)
+			cp -f "$archive" "${dest_dir}/$(basename "$archive")" >/dev/null 2>&1
 			return $?
 		;;
 	esac
@@ -375,6 +531,17 @@ install_binary_atomic() {
 		rm -f "$temp_path" >/dev/null 2>&1
 		return 1
 	}
+	# B. Post-install health check: actually execute the binary. A valid ELF
+	# header (is_elf_binary) does not guarantee it runs on this device when the
+	# endian/float ABI is wrong. Fatal for the client, a warning for the ctrl.
+	if [ "$target" = "$TARGET_BIN" ]; then
+		if ! binary_health_check "$target"; then
+			log_worker "安装后健康检查失败: ${target} 无法在本机执行 (可能架构不匹配)"
+			return 1
+		fi
+	elif [ "$target" = "$TARGET_CTRL_BIN" ]; then
+		binary_health_check "$target" || log_worker "安装后健康检查警告: ${target} 无法在本机执行"
+	fi
 	return 0
 }
 
@@ -455,6 +622,28 @@ process_claimed() {
 	if ! mkdir -p "$work_dir" >/dev/null 2>&1; then
 		log_worker "upload failed: unable to create work directory"
 		write_state "failed" "upload failed: unable to create work directory" "$upload_asset" "" "$arch" ""
+		rm -f "$upload_path" >/dev/null 2>&1
+		return 1
+	fi
+	# A. Disk space precheck (small-flash devices). Need room in /usr/bin for the
+	# installed binaries and in /tmp for the work directory extraction.
+	upload_size_kb=$(( $(wc -c <"$upload_path" 2>/dev/null | tr -d '[:space:]') / 1024 ))
+	# Installed binaries are UPX-compressed, so they end up SMALLER than the
+	# uploaded (uncompressed) asset; require at most the asset size plus a small
+	# margin, and ~2x in /tmp for extraction. No large fixed floor.
+	need_install_kb=$(( upload_size_kb + 2048 ))
+	need_tmp_kb=$(( upload_size_kb * 2 + 1024 ))
+	if ! check_free_space "$INSTALL_BIN_DIR" "$need_install_kb"; then
+		log_worker "upload rejected: 安装目录空间不足(需约 $(format_size $((need_install_kb * 1024))) 可用)"
+		write_state "failed" "upload rejected: 安装目录空间不足" "$upload_asset" "" "$arch" ""
+		rm -rf "$work_dir" >/dev/null 2>&1
+		rm -f "$upload_path" >/dev/null 2>&1
+		return 1
+	fi
+	if ! check_free_space "$work_dir" "$need_tmp_kb"; then
+		log_worker "upload rejected: 临时目录空间不足(需约 $(format_size $((need_tmp_kb * 1024))) 可用)"
+		write_state "failed" "upload rejected: 临时目录空间不足" "$upload_asset" "" "$arch" ""
+		rm -rf "$work_dir" >/dev/null 2>&1
 		rm -f "$upload_path" >/dev/null 2>&1
 		return 1
 	fi
@@ -540,12 +729,17 @@ process_claimed() {
 		clear_version_state
 		sync_uci_binary_path
 		write_state "success" "uploaded binary installed to /usr/bin${ctrl_note}" "$upload_asset" "" "$arch" "$TARGET_BIN"
+		# E: structured event for the status view (the version sidecar is
+		# intentionally NOT written here - 8.9.4 requires upload to clear it
+		# so a manually uploaded binary is not shown as the fixed version).
+		log_event "install_success" "cli=${TARGET_BIN} ctrl=${TARGET_CTRL_BIN} asset=${upload_asset}${ctrl_note} source=upload"
 		if queue_restart; then
 			log_worker "upload worker installed asset=${upload_asset} target=${TARGET_BIN}${ctrl_note} restart_queued=1"
 		else
 			log_worker "upload worker installed asset=${upload_asset} target=${TARGET_BIN}${ctrl_note} restart_queued=0"
 		fi
 	else
+		log_event "upload_failed" "asset=${upload_asset}"
 		log_worker "upload worker failed asset=${upload_asset}"
 	fi
 
