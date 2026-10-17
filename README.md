@@ -37,7 +37,7 @@ OpenWrt LuCI 插件，用于管理 VNT2 命令行客户端 `vnt2_cli` 与控制�
 系统 → 软件包 → 上传软件包，安装即可；或 SSH 执行：
 
 ```sh
-opkg install /tmp/luci-app-vnt2cli_*.ipk
+opkg update && opkg install /tmp/luci-app-vnt2cli_<版本>-all.ipk
 ```
 
 ### OpenWrt 25.12.x（APK）
@@ -45,7 +45,7 @@ opkg install /tmp/luci-app-vnt2cli_*.ipk
 Release 发布的 `.apk` 由 SDK 自编译构建，未使用官方签名密钥，属于未签名包，安装和后续升级都需要 `--allow-untrusted` 参数。将 APK 上传到路由器 `/tmp/` 后通过 SSH 执行：
 
 ```sh
-apk add --allow-untrusted /tmp/luci-app-vnt2cli_*.apk
+apk --update-cache add --allow-untrusted /tmp/luci-app-vnt2cli_<版本>-all.apk
 ```
 
 > 注意：LuCI 软件包上传页面不会自动添加 `--allow-untrusted` 参数，APK 请通过 SSH 安装。
