@@ -237,10 +237,10 @@ for f in \
 done
 
 # ---------- fixed download policy ----------
-if grep -q 'VNT2_FIXED_REPO="vnt-dev/vnt"' "$INIT" && grep -q 'VNT2_FIXED_VERSION="2.0.10"' "$INIT"; then
+if grep -q 'VNT2_FIXED_REPO="vnt-dev/vnt"' "$INIT" && grep -q 'VNT2_FIXED_VERSION="2.0.11"' "$INIT"; then
 	ok
 else
-	fail "init script must pin the fixed repo vnt-dev/vnt and version 2.0.10"
+	fail "init script must pin the fixed repo vnt-dev/vnt and version 2.0.11"
 fi
 
 if grep -q 'releases/tags/' "$INIT" && ! grep -q 'releases?per_page\|releases/latest' "$INIT"; then

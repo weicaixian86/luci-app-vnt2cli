@@ -5,7 +5,7 @@ PENDING_FILE="${VNT2_UPLOAD_PENDING_FILE:-/etc/vnt2/upload.pending}"
 CLAIMED_FILE="${VNT2_UPLOAD_CLAIMED_FILE:-/etc/vnt2/upload.claimed}"
 UPLOAD_DIR="${VNT2_UPLOAD_DIR:-/etc/vnt2/upload}"
 DOWNLOAD_LOG="${VNT2_UPLOAD_LOG_FILE:-/tmp/vnt2-download.log}"
-VNT2_FIXED_VERSION="${VNT2_FIXED_VERSION:-2.0.10}"
+VNT2_FIXED_VERSION="${VNT2_FIXED_VERSION:-2.0.11}"
 DOWNLOAD_STATE="${VNT2_UPLOAD_STATE_FILE:-/tmp/vnt2-download-cli.state}"
 DOWNLOAD_EVENTS="${VNT2_UPLOAD_EVENTS:-/tmp/vnt2-download.events}"
 VERSION_STATE_FILE="${VNT2_VERSION_STATE_FILE:-/etc/config/vnt2-cli.version}"
@@ -264,7 +264,7 @@ binary_health_check() {
 	[ "$rc" -eq 0 ]
 }
 
-# Parse the running binary's self-reported version (e.g. "vnt2-cli 2.0.10").
+# Parse the running binary's self-reported version (e.g. "vnt2-cli 2.0.11").
 get_installed_version() {
 	local p="$1" out v
 	[ -x "$p" ] || return 1
