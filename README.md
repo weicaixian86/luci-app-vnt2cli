@@ -55,13 +55,109 @@ apk --update-cache add --allow-untrusted /tmp/luci-app-vnt2cli_<版本>-all.apk
 ### OpenWrt 24.10.x
 
 ```sh
-opkg remove luci-app-vnt2cli
+# ===== OpenWrt 24.10 (opkg) 手工精确卸载 luci-app-vnt2cli =====
+# ---------- 1. 停止并禁用服务 ----------
+/etc/init.d/vnt2-upload-worker stop 2>/dev/null; /etc/init.d/vnt2-upload-worker disable 2>/dev/null
+/etc/init.d/vnt2-worker        stop 2>/dev/null; /etc/init.d/vnt2-worker        disable 2>/dev/null
+/etc/init.d/vnt2               stop 2>/dev/null; /etc/init.d/vnt2               disable 2>/dev/null
+# ---------- 2. 优先用 opkg 正常卸载 ----------
+opkg remove luci-app-vnt2cli 2>/dev/null || echo "opkg remove 未成功，继续手工清理"
+# ---------- 3. 删插件实体文件（含配置，直接删除不备份）----------
+rm -f  /etc/init.d/vnt2 /etc/init.d/vnt2-worker /etc/init.d/vnt2-upload-worker
+rm -rf /usr/libexec/vnt2
+rm -f  /usr/lib/lua/luci/controller/vnt2.lua
+rm -f  /usr/lib/lua/luci/model/vnt2_text.lua
+rm -f  /usr/lib/lua/luci/model/cbi/vnt2.lua \
+       /usr/lib/lua/luci/model/cbi/vnt2_status.lua \
+       /usr/lib/lua/luci/model/cbi/vnt2_runtime_log.lua
+rm -rf /usr/lib/lua/luci/view/vnt2
+rm -f  /usr/share/luci/menu.d/luci-app-vnt2cli.json
+rm -f  /usr/share/rpcd/acl.d/luci-app-vnt2cli.json
+rm -f  /usr/bin/vnt2_cli /usr/bin/vnt2_ctrl /usr/bin/vnt2_cli.upxbak /usr/bin/vnt2_ctrl.upxbak
+rm -f  /etc/config/vnt2-cli.version /etc/config/vnt2-cli.version.*
+rm -f  /etc/config/vnt2 /etc/config/vnt2-machine-id
+rm -rf /etc/vnt2
+rm -f  /lib/upgrade/keep.d/vnt2cli
+rm -f  /tmp/vnt2_backup
+# ---------- 4. 清运行时残留 ----------
+rm -f  /tmp/vnt2cli.toml /tmp/vnt2-restart.pending /tmp/vnt2-cli-stderr.log \
+       /tmp/vnt2_cli_time /tmp/vnt2-sync.last /tmp/vnt2-last-device.conf \
+       /tmp/vnt2-download.log /tmp/vnt2-download.events /tmp/vnt2-download-cli.state \
+       /tmp/vnt2-download-web.state
+rm -rf /tmp/logs /tmp/vnt2-download-cache
+# ---------- 5. 清托管网络/防火墙对象 ----------
+uci -q delete network.VNT2
+uci -q delete firewall.vnt2zone
+uci -q delete firewall.vnt2fwlan
+uci -q delete firewall.vnt2fwwan
+uci -q delete firewall.lanfwvnt2
+uci -q delete firewall.wanfwvnt2
+uci commit network 2>/dev/null; uci commit firewall 2>/dev/null
+# ---------- 6. 清 LuCI 缓存并重载 ----------
+rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache
+/etc/init.d/rpcd   reload 2>/dev/null
+/etc/init.d/uhttpd reload 2>/dev/null
+# ---------- 7. 校验 ----------
+echo "--- 残留检查（应无输出）---"
+find /usr/lib/lua/luci /usr/share/luci /usr/share/rpcd /etc/init.d /usr/libexec /etc/vnt2 -iname '*vnt2*' 2>/dev/null
+echo "--- 设备身份仍在（应显示 machine-id）---"
+ls -l /etc/machine-id
 ```
 
 ### OpenWrt 25.12.x
 
 ```sh
-apk del luci-app-vnt2cli
+# ===== OpenWrt 25.12 / iStoreOS (apk) 手工精确卸载 luci-app-vnt2cli =====
+# ---------- 1. 停止并禁用服务 ----------
+/etc/init.d/vnt2-upload-worker stop 2>/dev/null; /etc/init.d/vnt2-upload-worker disable 2>/dev/null
+/etc/init.d/vnt2-worker        stop 2>/dev/null; /etc/init.d/vnt2-worker        disable 2>/dev/null
+/etc/init.d/vnt2               stop 2>/dev/null; /etc/init.d/vnt2               disable 2>/dev/null
+# ---------- 2. 删插件实体文件（含配置，直接删除不备份）----------
+rm -f  /etc/init.d/vnt2 /etc/init.d/vnt2-worker /etc/init.d/vnt2-upload-worker
+rm -rf /usr/libexec/vnt2
+rm -f  /usr/lib/lua/luci/controller/vnt2.lua
+rm -f  /usr/lib/lua/luci/model/vnt2_text.lua
+rm -f  /usr/lib/lua/luci/model/cbi/vnt2.lua \
+       /usr/lib/lua/luci/model/cbi/vnt2_status.lua \
+       /usr/lib/lua/luci/model/cbi/vnt2_runtime_log.lua
+rm -rf /usr/lib/lua/luci/view/vnt2
+rm -f  /usr/share/luci/menu.d/luci-app-vnt2cli.json
+rm -f  /usr/share/rpcd/acl.d/luci-app-vnt2cli.json
+rm -f  /usr/bin/vnt2_cli /usr/bin/vnt2_ctrl /usr/bin/vnt2_cli.upxbak /usr/bin/vnt2_ctrl.upxbak
+rm -f  /etc/config/vnt2-cli.version /etc/config/vnt2-cli.version.*
+rm -f  /etc/config/vnt2 /etc/config/vnt2-machine-id
+rm -rf /etc/vnt2
+rm -f  /lib/upgrade/keep.d/vnt2cli
+rm -f  /tmp/vnt2_backup
+# ---------- 3. 从 apk 数据库摘除本包条目块（不动其它包）----------
+TS=$(date +%Y%m%d-%H%M%S)
+cp /lib/apk/db/installed /lib/apk/db/installed.bak.$TS
+awk 'BEGIN{RS="";ORS="\n\n"} !/^P:luci-app-vnt2cli$/' /lib/apk/db/installed.bak.$TS > /tmp/installed.new \
+  && mv /tmp/installed.new /lib/apk/db/installed
+echo "已从 apk 数据库移除 luci-app-vnt2cli"
+# ---------- 4. 清运行时残留 ----------
+rm -f  /tmp/vnt2cli.toml /tmp/vnt2-restart.pending /tmp/vnt2-cli-stderr.log \
+       /tmp/vnt2_cli_time /tmp/vnt2-sync.last /tmp/vnt2-last-device.conf \
+       /tmp/vnt2-download.log /tmp/vnt2-download.events /tmp/vnt2-download-cli.state \
+       /tmp/vnt2-download-web.state
+rm -rf /tmp/logs /tmp/vnt2-download-cache
+# ---------- 5. 清托管网络/防火墙对象 ----------
+uci -q delete network.VNT2
+uci -q delete firewall.vnt2zone
+uci -q delete firewall.vnt2fwlan
+uci -q delete firewall.vnt2fwwan
+uci -q delete firewall.lanfwvnt2
+uci -q delete firewall.wanfwvnt2
+uci commit network 2>/dev/null; uci commit firewall 2>/dev/null
+# ---------- 6. 清 LuCI 缓存并重载 ----------
+rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache
+/etc/init.d/rpcd   reload 2>/dev/null
+/etc/init.d/uhttpd reload 2>/dev/null
+# ---------- 7. 校验 ----------
+echo "--- 残留检查（应无输出）---"
+find /usr/lib/lua/luci /usr/share/luci /usr/share/rpcd /etc/init.d /usr/libexec /etc/vnt2 -iname '*vnt2*' 2>/dev/null
+echo "--- 设备身份仍在（应显示 machine-id）---"
+ls -l /etc/machine-id
 ```
 
 ## 使用说明
