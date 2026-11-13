@@ -1078,6 +1078,7 @@ add_flag("tunnel", "fec", "启用 FEC 前向纠错", "损失一定带宽提升�
 add_flag("tunnel", "no_punch", "关闭自动 P2P 打洞", "显式直连节点地址仍可连接")
 add_flag("tunnel", "no_broadcast", "关闭虚拟网广播/组播转发", nil)
 add_flag("tunnel", "auto_sync_subnet", "自动同步出口子网", "自动获取并应用其他在线节点上报的出口子网")
+add_flag("tunnel", "no_nat", "关闭 VNT2 内置 NAT", "开启后 VNT2 防火墙区域 masq=0 并开启系统 IPv4 转发；关闭（默认）时 masq=1")
 add_flag("tunnel", "allow_ikev2", "允许与 IKEv2 客户端通信", nil)
 add_flag("tunnel", "allow_wireguard", "允许与 WireGuard 客户端通信", nil)
 
