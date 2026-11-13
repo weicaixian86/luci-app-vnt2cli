@@ -55,14 +55,14 @@ apk --update-cache add --allow-untrusted /tmp/luci-app-vnt2cli_<版本>-all.apk
 ### OpenWrt 24.10.x
 
 ```sh
-# ===== OpenWrt 24.10 (opkg) 手工精确卸载 luci-app-vnt2cli =====
+# ===== OpenWrt 24.10 (opkg) 卸载 luci-app-vnt2cli =====
 # ---------- 1. 停止并禁用服务 ----------
 /etc/init.d/vnt2-upload-worker stop 2>/dev/null; /etc/init.d/vnt2-upload-worker disable 2>/dev/null
 /etc/init.d/vnt2-worker        stop 2>/dev/null; /etc/init.d/vnt2-worker        disable 2>/dev/null
 /etc/init.d/vnt2               stop 2>/dev/null; /etc/init.d/vnt2               disable 2>/dev/null
-# ---------- 2. 优先用 opkg 正常卸载 ----------
-opkg remove luci-app-vnt2cli 2>/dev/null || echo "opkg remove 未成功，继续手工清理"
-# ---------- 3. 删插件实体文件（含配置，直接删除不备份）----------
+# ---------- 2. 用 opkg 正常卸载（IPK 不会有 apk 那种库脏问题）----------
+opkg remove luci-app-vnt2cli || echo "opkg remove 未成功，继续兜底清理"
+# ---------- 3. 兜底清理实体文件（opkg 删过的会自然跳过）----------
 rm -f  /etc/init.d/vnt2 /etc/init.d/vnt2-worker /etc/init.d/vnt2-upload-worker
 rm -rf /usr/libexec/vnt2
 rm -f  /usr/lib/lua/luci/controller/vnt2.lua
@@ -100,19 +100,30 @@ rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache
 # ---------- 7. 校验 ----------
 echo "--- 残留检查（应无输出）---"
 find /usr/lib/lua/luci /usr/share/luci /usr/share/rpcd /etc/init.d /usr/libexec /etc/vnt2 -iname '*vnt2*' 2>/dev/null
-echo "--- 设备身份仍在（应显示 machine-id）---"
-ls -l /etc/machine-id
+echo "--- 设备身份仍在 ---"; ls -l /etc/machine-id
 ```
 
 ### OpenWrt 25.12.x
 
 ```sh
-# ===== OpenWrt 25.12 / iStoreOS (apk) 手工精确卸载 luci-app-vnt2cli =====
+# ===== OpenWrt 25.12 / iStoreOS (apk) 卸载 luci-app-vnt2cli =====
 # ---------- 1. 停止并禁用服务 ----------
 /etc/init.d/vnt2-upload-worker stop 2>/dev/null; /etc/init.d/vnt2-upload-worker disable 2>/dev/null
 /etc/init.d/vnt2-worker        stop 2>/dev/null; /etc/init.d/vnt2-worker        disable 2>/dev/null
 /etc/init.d/vnt2               stop 2>/dev/null; /etc/init.d/vnt2               disable 2>/dev/null
-# ---------- 2. 删插件实体文件（含配置，直接删除不备份）----------
+# ---------- 2. 用 apk 正常卸载 ----------
+# 若报 "Not committing changes due to missing repository tags"，先执行 2a 屏蔽坏仓库再重试 2b
+apk del luci-app-vnt2cli 2>/dev/null && echo "apk del 成功" || {
+  echo "apk del 未成功，尝试屏蔽失效仓库后重试"
+  # 2a. 临时注释掉失效的第三方仓库（按需，通常是 daeuniverse），只注释仓库列表文件，绝不改 world
+  if [ -f /etc/apk/repositories.d/daeuniverse.list ]; then
+    cp -n /etc/apk/repositories.d/daeuniverse.list /root/daeuniverse.list.bak 2>/dev/null
+    sed -i 's|^[^#]|#&|' /etc/apk/repositories.d/daeuniverse.list
+  fi
+  # 2b. 再次卸载；仍失败则离线强制
+  apk del luci-app-vnt2cli 2>/dev/null || apk del --no-network --force luci-app-vnt2cli
+}
+# ---------- 3. 兜底清理实体文件（apk 删过的会自然跳过）----------
 rm -f  /etc/init.d/vnt2 /etc/init.d/vnt2-worker /etc/init.d/vnt2-upload-worker
 rm -rf /usr/libexec/vnt2
 rm -f  /usr/lib/lua/luci/controller/vnt2.lua
@@ -129,12 +140,6 @@ rm -f  /etc/config/vnt2 /etc/config/vnt2-machine-id
 rm -rf /etc/vnt2
 rm -f  /lib/upgrade/keep.d/vnt2cli
 rm -f  /tmp/vnt2_backup
-# ---------- 3. 从 apk 数据库摘除本包条目块（不动其它包）----------
-TS=$(date +%Y%m%d-%H%M%S)
-cp /lib/apk/db/installed /lib/apk/db/installed.bak.$TS
-awk 'BEGIN{RS="";ORS="\n\n"} !/^P:luci-app-vnt2cli$/' /lib/apk/db/installed.bak.$TS > /tmp/installed.new \
-  && mv /tmp/installed.new /lib/apk/db/installed
-echo "已从 apk 数据库移除 luci-app-vnt2cli"
 # ---------- 4. 清运行时残留 ----------
 rm -f  /tmp/vnt2cli.toml /tmp/vnt2-restart.pending /tmp/vnt2-cli-stderr.log \
        /tmp/vnt2_cli_time /tmp/vnt2-sync.last /tmp/vnt2-last-device.conf \
@@ -156,8 +161,8 @@ rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache
 # ---------- 7. 校验 ----------
 echo "--- 残留检查（应无输出）---"
 find /usr/lib/lua/luci /usr/share/luci /usr/share/rpcd /etc/init.d /usr/libexec /etc/vnt2 -iname '*vnt2*' 2>/dev/null
-echo "--- 设备身份仍在（应显示 machine-id）---"
-ls -l /etc/machine-id
+echo "--- apk 数据库登记数（应为 0）---"; grep -c '^P:luci-app-vnt2cli$' /lib/apk/db/installed
+echo "--- 设备身份仍在 ---"; ls -l /etc/machine-id
 ```
 
 ## 使用说明
